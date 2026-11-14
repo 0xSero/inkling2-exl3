@@ -1,0 +1,14 @@
+services:
+  sweep:
+    image: ghcr.io/0xsero/inkling2-exl3:latest
+    command: sweep
+    ipc: host
+    volumes: ["${MODELS_DIR:-$HOME/models}:/models"]
+    environment: [SPEC=${SPEC:-on}, REPEATS=${REPEATS:-3}]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, count: all, capabilities: [gpu]}]}}}
+  serve:
+    image: ghcr.io/0xsero/inkling2-exl3:latest
+    command: serve
+    ipc: host
+    volumes: ["${MODELS_DIR:-$HOME/models}:/models"]
+    deploy: {resources: {reservations: {devices: [{driver: nvidia, count: all, capabilities: [gpu]}]}}}
