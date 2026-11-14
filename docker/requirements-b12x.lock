@@ -1,0 +1,19 @@
+# b12x add-on, installed --no-deps on top of requirements-engine.lock exactly as in the validated env
+# (nvidia-cutlass-dsl[cu13] 4.8.1 + its CUDA 13 compiler pieces, cuda-python 12.9.10, apache-tvm-ffi).
+# cuda-bindings 12.9.10 deliberately overrides torch 2.10's 12.9.4 pin, as validated.
+apache-tvm-ffi==0.1.16
+cuda-bindings==12.9.10
+cuda-python==12.9.10
+nvidia-cuda-crt==13.3.73
+nvidia-cuda-nvcc==13.3.73
+nvidia-cuda-nvdisasm==13.5.37
+nvidia-cuda-tileiras==13.3.36
+nvidia-cutlass-dsl==4.8.1
+nvidia-cutlass-dsl-libs-base==4.8.1
+nvidia-cutlass-dsl-libs-core==4.8.1
+nvidia-cutlass-dsl-libs-cu12==4.8.1
+nvidia-cutlass-dsl-libs-cu13==4.8.1
+nvidia-nccl-cu13==2.32.6
+nvidia-nvjitlink==13.5.37
+nvidia-nvvm==13.3.73
+protobuf==7.36.2

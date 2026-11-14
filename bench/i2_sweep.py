@@ -15,8 +15,14 @@ ap.add_argument("--prompt", type=int, default=int(os.environ.get("PROMPT", "256"
 ap.add_argument("--graph", type=int, default=int(os.environ.get("GRAPH", "1")))
 ap.add_argument("--prompt-file", default=os.environ.get("PROMPT_FILE", "/opt/exllamav3/README.md"), help="public text used for prompts")
 ap.add_argument("--layers", type=int, default=48)
+ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "1")), help="verify-step routed experts through the b12x fused Trellis MoE (server default)")
+ap.add_argument("--kv-rot", type=int, default=int(os.environ.get("KV_ROT", "1")), help="global 4-bit KV: Hadamard rotation (server default)")
+ap.add_argument("--kv-ng", type=int, default=int(os.environ.get("KV_NG", "4")), help="global 4-bit KV: scale groups per 128-vector")
+ap.add_argument("--kv-q16", type=int, default=int(os.environ.get("KV_Q16", "1")), help="global 4-bit KV: 16-level grid")
 ap.add_argument("--out", default=os.environ.get("RESULTS_DIR", "/models/results"))
 a = ap.parse_args()
+if a.b12x:
+    os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
 
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
@@ -38,13 +44,19 @@ log(f"loaded in {time.time()-t0:.0f}s, {torch.cuda.memory_allocated()/2**30:.1f}
 Bs = [int(x) for x in a.concurrency.split(",")]
 B_MAX = max(Bs)
 PP = (a.prompt + a.steps + 8 * 4 + 64) // 64 + 2          # pages per slot
-eng = I2Engine(model, dev, rank, world, max_slots=B_MAX, num_pages=B_MAX * PP + 8, bits_g=4, bits_l=8)
+eng = I2Engine(model, dev, rank, world, max_slots=B_MAX, num_pages=B_MAX * PP + 8, bits_g=4, bits_l=8,
+               kv_rot=bool(a.kv_rot), kv_ng=a.kv_ng, kv_q16=bool(a.kv_q16), max_rows=512)
 for s in range(B_MAX):
     for p in range(PP): eng.page_table[s, p] = s * PP + p
 draft = None
 if spec_on:
     draft = I2Draft(os.path.join(a.model_dir, "mtp.safetensors"), eng, dev, rank, world, B_MAX, B_MAX * PP + 8, 64)
     log("draft loaded", f"{torch.cuda.memory_allocated()/2**30:.1f} GB/rank")
+if a.b12x:
+    from exllamav3.modules.inkling2_b12x import B12xMoE
+    t1 = time.time()
+    eng.b12x = B12xMoE(model.layers, dev, sizes=sorted(set(8 * b for b in Bs)))
+    log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-t1:.0f}s (tile {eng.b12x.tile})")
 V = cfg.i2.unpadded_vocab
 
 # Prompts: slices of a public text file, tokenized with the model's tokenizer
@@ -143,8 +155,8 @@ for B in Bs:
 if rank == 0:
     meta = dict(date=time.strftime("%Y-%m-%d %H:%M:%S"), model_dir_name=os.path.basename(a.model_dir.rstrip("/")),
                 prompt=a.prompt, tokens_per_seq=a.steps, repeats=a.repeats, cuda_graphs=bool(a.graph),
-                spec="on", gpus=[torch.cuda.get_device_name(i) for i in range(world)])
-    lab = "speculative decoding (DSpark/MTP)"
+                spec="on", b12x=bool(a.b12x), kv=dict(bits_g=4, bits_l=8, rot=a.kv_rot, ng=a.kv_ng, q16=a.kv_q16), gpus=[torch.cuda.get_device_name(i) for i in range(world)])
+    lab = "speculative decoding (DSpark/MTP)" + (", b12x verify MoE" if a.b12x else "")
     lines = [f"### Inkling-2-Small EXL3 sweep - {lab}", "",
              f"{a.prompt}-token prompts, {a.steps} generated tokens/seq, median of {a.repeats} repeats, CUDA graphs={'on' if a.graph else 'off'}", "",
              "| concurrency | decode tok/s | accept len | steps/s | prefill tok/s |", "|---|---|---|---|---|"]

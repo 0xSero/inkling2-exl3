@@ -204,6 +204,7 @@ def _qkv_post_kernel(
     qk_clip, rel_clip, eps, log_alpha, log_n_floor, ring_pos_stride,
     G: tl.constexpr, GP: tl.constexpr, DH: tl.constexpr, DR: tl.constexpr, HKL: tl.constexpr,
     IS_GLOBAL: tl.constexpr, BITS: tl.constexpr, RING: tl.constexpr, PS: tl.constexpr, WRITE_RING: tl.constexpr,
+    rot_ptr = None, ROT: tl.constexpr = False, NG: tl.constexpr = 1, Q16: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     hk = tl.program_id(1)
@@ -250,6 +251,14 @@ def _qkv_post_kernel(
     kn = tl.sqrt(tl.sum(kc * kc, 0))
     kk = (kc * tl.minimum(qk_clip / (kn + 1e-6), 1.0)).to(tl.bfloat16).to(tl.float32)
     vv = (vc * tl.rsqrt(tl.sum(vc * vc, 0) / DH + eps)).to(tl.bfloat16).to(tl.float32)
+    if ROT:
+        # cache-space rotation x M / sqrt(DH), M = diag(signs) * Hadamard (+-1, exact in bf16); fp32 accumulation
+        offs_r16 = tl.arange(0, 16)
+        Mrot = tl.load(rot_ptr + offs_d[:, None] * DH + offs_d[None, :])
+        kv2 = tl.where(offs_r16[:, None] == 0, kk[None, :], tl.where(offs_r16[:, None] == 1, vv[None, :], 0.0))
+        kvr = tl.dot(kv2.to(tl.bfloat16), Mrot) * (DH ** -0.5)
+        kk = tl.sum(tl.where(offs_r16[:, None] == 0, kvr, 0.0), 0)
+        vv = tl.sum(tl.where(offs_r16[:, None] == 1, kvr, 0.0), 0)
 
     # cache row
     if IS_GLOBAL:
@@ -262,6 +271,43 @@ def _qkv_post_kernel(
     if BITS == 16:
         tl.store(kbase + offs_d, kk.to(tl.bfloat16))
         tl.store(vbase + offs_d, vv.to(tl.bfloat16))
+    elif NG > 1 or Q16:
+        # NG scale groups of DH // NG elements; Q16 (4-bit): 16 symmetric levels (c - 7.5) * amax / 7.5
+        GS: tl.constexpr = DH // NG
+        if BITS == 8:
+            QMAX2: tl.constexpr = 127.0
+        elif Q16:
+            QMAX2: tl.constexpr = 7.5
+        else:
+            QMAX2: tl.constexpr = 7.0
+        kg = tl.reshape(kk, [NG, GS])
+        vg = tl.reshape(vv, [NG, GS])
+        ksg = tl.maximum(tl.max(tl.abs(kg), 1) / QMAX2, 1e-8)
+        vsg = tl.maximum(tl.max(tl.abs(vg), 1) / QMAX2, 1e-8)
+        ksg = ksg.to(tl.float16).to(tl.float32)          # quantize against the stored scale
+        vsg = vsg.to(tl.float16).to(tl.float32)
+        offs_ng = tl.arange(0, NG)
+        tl.store(ks_ptr + row * sc_stride_pos + hk * NG + offs_ng, ksg.to(tl.float16))
+        tl.store(vs_ptr + row * sc_stride_pos + hk * NG + offs_ng, vsg.to(tl.float16))
+        if Q16 and BITS == 4:
+            kqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(kg / ksg[:, None] + 7.5), 0.0), 15.0)
+            vqf = tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(vg / vsg[:, None] + 7.5), 0.0), 15.0)
+            kqf = tl.reshape(kqf, [DH]) - 8.0                   # stored as (code - 8) + 8 like the plain path
+            vqf = tl.reshape(vqf, [DH]) - 8.0
+        else:
+            kqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(kg / ksg[:, None]), -QMAX2 - 1), QMAX2), [DH])
+            vqf = tl.reshape(tl.minimum(tl.maximum(tl.extra.cuda.libdevice.rint(vg / vsg[:, None]), -QMAX2 - 1), QMAX2), [DH])
+        if BITS == 8:
+            tl.store(kbase + offs_d, kqf.to(tl.int8))
+            tl.store(vbase + offs_d, vqf.to(tl.int8))
+        else:
+            ku = tl.reshape((kqf + 8).to(tl.int32), [DH // 2, 2])
+            kl, kh2 = tl.split(ku)
+            vu = tl.reshape((vqf + 8).to(tl.int32), [DH // 2, 2])
+            vl, vh2 = tl.split(vu)
+            offs_p = tl.arange(0, DH // 2)
+            tl.store(kbase + offs_p, (kl | (kh2 << 4)).to(tl.uint8))
+            tl.store(vbase + offs_p, (vl | (vh2 << 4)).to(tl.uint8))
     else:
         QMAX: tl.constexpr = 127 if BITS == 8 else 7
         ksc = tl.maximum(tl.max(tl.abs(kk), 0) / QMAX, 1e-8)
@@ -296,7 +342,11 @@ def _qkv_post_kernel(
     qx = qx * qs
     qn = tl.sqrt(tl.sum(qx * qx, 1))
     qo = qx * tl.minimum(qk_clip / (qn + 1e-6), 1.0)[:, None]
-    qo = qo.to(tl.bfloat16).to(tl.float32) * tau
+    qo = qo.to(tl.bfloat16).to(tl.float32)
+    if ROT:
+        Mq = tl.load(rot_ptr + offs_d[:, None] * DH + offs_d[None, :])
+        qo = tl.dot(qo.to(tl.bfloat16), Mq) * (DH ** -0.5)
+    qo = qo * tau
     tl.store(q_out_ptr + (t * (G * HKL) + hq[:, None]) * DH + offs_d[None, :], qo.to(tl.bfloat16), mask = gm[:, None])
     offs_r = tl.arange(0, DR)
     rp = qbuf_ptr + t * stride_qb + rel_off + hq[:, None] * DR + offs_r[None, :]
@@ -311,7 +361,9 @@ def _qkv_post_kernel(
 
 def qkv_post(qbuf, kbuf, vbuf, kc, vc, qscale, rscale, kring, vring, slot, pos, nprev, q_out, rel_out,
              kq, vq, ks, vs, page_table, cfg, is_global, bits, rel_off, k_dyn_off, v_dyn_off, ring_size, ps, write_ring,
-             hkl, g):
+             hkl, g, rot = None, ng = 1, q16 = False):
+    """rot: optional [128, 128] bf16 +-1 matrix M (cache-space rotation x M / sqrt(128) of K, V and Q);
+    ng: scale groups per 128-vector (ks/vs [..., Hkl, ng]); q16: 16-level symmetric 4-bit grid"""
     T = qbuf.shape[0]
     _qkv_post_kernel[(T, hkl)](
         qbuf, kbuf, vbuf, kc, vc, qscale, rscale, kring, vring, slot, pos, nprev, q_out, rel_out,
@@ -319,11 +371,17 @@ def qkv_post(qbuf, kbuf, vbuf, kc, vc, qscale, rscale, kring, vring, slot, pos, 
         page_table if page_table is not None else slot, page_table.stride(0) if page_table is not None else 0,
         qbuf.stride(0), kbuf.stride(0), vbuf.stride(0),
         rel_off, k_dyn_off, v_dyn_off,
-        kq.stride(-3), kq.stride(-2), (ks.stride(-2) if ks is not None else 0),
+        kq.stride(-3), kq.stride(-2), (_sc_stride_pos(ks, ng) if ks is not None else 0),
         cfg.qk_clip, cfg.rel_clip, cfg.eps, cfg.log_alpha, float(cfg.log_n_floor), kring.stride(1),
-        G = g, GP = 8, DH = 128, DR = 16, HKL = hkl, IS_GLOBAL = is_global, BITS = bits, RING = ring_size, PS = ps,
-        WRITE_RING = write_ring, num_warps = 4,
+        G = g, GP = 16 if rot is not None else 8, DH = 128, DR = 16, HKL = hkl, IS_GLOBAL = is_global, BITS = bits,
+        RING = ring_size, PS = ps, WRITE_RING = write_ring,
+        rot_ptr = rot if rot is not None else qbuf, ROT = rot is not None, NG = ng, Q16 = q16, num_warps = 4,
     )
+
+
+def _sc_stride_pos(ks, ng):
+    """scale tensor stride per cache row: ks is [..., PS or RING, Hkl] (ng = 1) or [..., PS or RING, Hkl, ng]"""
+    return ks.stride(-2) if ng == 1 else ks.stride(-3)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
@@ -331,8 +389,28 @@ def qkv_post(qbuf, kbuf, vbuf, kc, vc, qscale, rscale, kring, vring, slot, pos, 
 
 @triton.jit
 def _load_kv_tile(base_ptr, sc_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d,
-                  BITS: tl.constexpr, DH: tl.constexpr):
+                  BITS: tl.constexpr, DH: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False):
     """[BN, DH] dequantized tile (bf16 values as fp32)"""
+    if BITS != 16 and (NG > 1 or Q16):
+        GS: tl.constexpr = DH // NG
+        if BITS == 8:
+            ptr = base_ptr + rows[:, None] * cache_stride_pos + hk * cache_stride_h + offs_d[None, :]
+            c = tl.load(ptr, mask = valid[:, None], other = 0).to(tl.float32)
+        else:
+            offs_p = tl.arange(0, DH // 2)
+            ptr = base_ptr + rows[:, None] * cache_stride_pos + hk * cache_stride_h + offs_p[None, :]
+            b = tl.load(ptr, mask = valid[:, None], other = 0).to(tl.int32)
+            if Q16:
+                lo = ((b & 15).to(tl.float32) - 7.5)
+                hi = ((b >> 4).to(tl.float32) - 7.5)
+            else:
+                lo = ((b & 15) - 8).to(tl.float32)
+                hi = ((b >> 4) - 8).to(tl.float32)
+            c = tl.reshape(tl.join(lo, hi), [lo.shape[0], DH])
+        offs_ng = tl.arange(0, NG)
+        sc = tl.load(sc_ptr + rows[:, None] * sc_stride_pos + hk * NG + offs_ng[None, :], mask = valid[:, None], other = 0.0)
+        c3 = tl.reshape(c, [c.shape[0], NG, GS]) * sc.to(tl.float32)[:, :, None]
+        return tl.reshape(c3, [c.shape[0], DH]).to(tl.bfloat16).to(tl.float32)
     if BITS == 16:
         ptr = base_ptr + rows[:, None] * cache_stride_pos + hk * cache_stride_h + offs_d[None, :]
         return tl.load(ptr, mask = valid[:, None], other = 0.0).to(tl.float32)
@@ -359,7 +437,7 @@ def _attn_kernel(
     stride_sink_t, cache_stride_pos, cache_stride_h, sc_stride_pos, sm_scale,
     G: tl.constexpr, GP: tl.constexpr, DH: tl.constexpr, HKL: tl.constexpr, BN: tl.constexpr, NSPLIT: tl.constexpr,
     IS_GLOBAL: tl.constexpr, BITS: tl.constexpr, RING: tl.constexpr, PS: tl.constexpr, WINDOW: tl.constexpr,
-    EXTENT: tl.constexpr,
+    EXTENT: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     hk = tl.program_id(1)
@@ -398,7 +476,7 @@ def _attn_kernel(
             rows = pg.to(tl.int64) * PS + j % PS
         else:
             rows = slot.to(tl.int64) * RING + j % RING
-        k = _load_kv_tile(kq_ptr, ks_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH)
+        k = _load_kv_tile(kq_ptr, ks_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
         s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
         d = pos - j
         bias = tl.load(R_row[:, None] + d[None, :], mask = gm[:, None] & (valid & (d < EXTENT))[None, :], other = 0.0)
@@ -408,7 +486,7 @@ def _attn_kernel(
         alpha = tl.exp(m_i - m_new)
         p = tl.exp(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        v = _load_kv_tile(vq_ptr, vs_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH)
+        v = _load_kv_tile(vq_ptr, vs_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v.to(tl.float16))
         m_i = m_new
     pbase = ((t * HL + hq) * NSPLIT + sp)
@@ -419,7 +497,7 @@ def _attn_kernel(
 
 @triton.jit
 def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t, HL: tl.constexpr, DH: tl.constexpr,
-                         NSPLIT: tl.constexpr):
+                         NSPLIT: tl.constexpr, rot_ptr = None, ROT: tl.constexpr = False):
     t = tl.program_id(0)
     h = tl.program_id(1)
     offs_s = tl.arange(0, NSPLIT)
@@ -432,6 +510,10 @@ def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t,
     den = tl.sum(l * w, 0)
     o = tl.load(po_ptr + (base + offs_s)[:, None] * DH + offs_d[None, :])
     o = tl.sum(o * w[:, None], 0) / den
+    if ROT:
+        # back from cache space: o = o' M^T / sqrt(DH)  (o'[i] summed against row i of M)
+        Mr = tl.load(rot_ptr + offs_d[:, None] * DH + offs_d[None, :]).to(tl.float32)     # Mr[j, i] = M[j, i]
+        o = tl.sum(Mr * o[None, :], 1) * (DH ** -0.5)                                       # o[j] = sum_i o'[i] M[j, i]
     o = o.to(tl.bfloat16).to(tl.float32)
     g = tl.load(gate_ptr + t * stride_gate_t + h * DH + offs_d).to(tl.float32)
     o = o * tl.sigmoid(g)
@@ -439,7 +521,7 @@ def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t,
 
 
 def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, o_out, cfg, is_global, bits, ring_size, ps,
-              nsplit, hkl, g, bn = 64):
+              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False):
     """q: [T, Hl, 128] bf16, R: [T, Hl, 1024] fp32, sink: [T, Hl] view, gate: [T, Hl*128] view. Writes o_out [T, Hl*128] bf16"""
     T = q.shape[0]
     pm, pl, po = scratch
@@ -448,11 +530,22 @@ def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, 
         q, R, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq,
         page_table if page_table is not None else slot, page_table.stride(0) if page_table is not None else 0, slot, pos,
         pm, pl, po,
-        sink.stride(0), kq.stride(-3), kq.stride(-2), (ks.stride(-2) if ks is not None else 0), 128 ** -0.5,
+        sink.stride(0), kq.stride(-3), kq.stride(-2), (_sc_stride_pos(ks, ng) if ks is not None else 0), 128 ** -0.5,
         G = g, GP = 16, DH = 128, HKL = hkl, BN = bn, NSPLIT = nsplit, IS_GLOBAL = is_global, BITS = bits,
-        RING = ring_size, PS = ps, WINDOW = cfg.window, EXTENT = cfg.rel_extent, num_warps = 4,
+        RING = ring_size, PS = ps, WINDOW = cfg.window, EXTENT = cfg.rel_extent, NG = ng, Q16 = q16, num_warps = 4,
     )
-    _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = nsplit)
+    _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = nsplit,
+                                  rot_ptr = rot if rot is not None else gate, ROT = rot is not None)
+
+
+def make_kv_rotation(device, seed = 20261114, dh = 128):
+    """M = diag(random signs) @ H_dh (Sylvester Hadamard), +-1 entries in bf16; M M^T = dh I"""
+    H = torch.ones((1, 1))
+    while H.shape[0] < dh:
+        H = torch.cat([torch.cat([H, H], 1), torch.cat([H, -H], 1)], 0)
+    g = torch.Generator().manual_seed(seed)
+    s = (torch.randint(0, 2, (dh,), generator = g) * 2 - 1).float()
+    return (s[:, None] * H).to(torch.bfloat16).contiguous().to(device)
 
 
 # ----------------------------------------------------------------------------------------------------------------------

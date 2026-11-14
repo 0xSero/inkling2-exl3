@@ -10,6 +10,16 @@ EXTRA=$(git -C "$FORK" diff --name-only --diff-filter=A "$BASE..$BR" -- 'exllama
 NEW=$(printf '%s\n' $NEW $EXTRA | sort -u)
 rm -rf "$HERE/overlay/exllamav3"; mkdir -p "$HERE/overlay"
 for f in $NEW; do mkdir -p "$HERE/overlay/$(dirname "$f")"; git -C "$FORK" show "$BR:$f" > "$HERE/overlay/$f"; done
+# public paths: pinned FlashInfer tree lives at /opt/flashinfer in the image
+sed -i -E 's#os\.environ\.get\("I2_B12X_PATH", "[^"]*"\)#os.environ.get("I2_B12X_PATH", "/opt/flashinfer")#' "$HERE/overlay/exllamav3/modules/inkling2_b12x.py" 2>/dev/null || true
+# canonical server (fork serving/i2_server.py) with public defaults: no sys.path hack, MODEL_DIR, port 8000
+git -C "$FORK" show "$BR:serving/i2_server.py" \
+  | sed -E -e '/^sys\.path\.insert\(0, "[^"]*"\)$/d' \
+           -e 's#serving/i2_server\.py --port 8123#server/i2_server.py --port 8000#' \
+           -e 's#os\.environ\.get\("I2_MODEL", "[^"]*"\)#os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-4bpw")#' \
+           -e 's#(add_argument\("--port", type=int, default=)8123#\18000#' \
+           -e 's#needs \.venv-eng \+ I2_B12X_PATH#needs the b12x stack: cutlass-dsl + FlashInfer tree at I2_B12X_PATH#' \
+  > "$HERE/server/i2_server.py"
 MODIFIED=$(git -C "$FORK" diff --name-only --diff-filter=M "$BASE..$BR" -- exllamav3)
 git -C "$FORK" diff "$BASE..$BR" -- $MODIFIED > "$HERE/patches/upstream-modifications.patch"
 git -C "$FORK" rev-parse --short "$BR" > "$HERE/overlay/FORK_COMMIT"

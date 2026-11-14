@@ -16,16 +16,22 @@ from exllamav3.modules.inkling2_draft import I2Draft
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model", default=os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-4bpw"))
-ap.add_argument("--port", type=int, default=8123)
+ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--host", default="0.0.0.0")
 ap.add_argument("--slots", type=int, default=16)
 ap.add_argument("--kv-gb", type=float, default=0.0, help="KV cache budget per GPU for global-layer pages (0 = auto from free memory)")
 ap.add_argument("--reserve-gb", type=float, default=2.0, help="free memory kept for workspace when sizing KV automatically (measured peak extra use: 0.6 GiB)")
-ap.add_argument("--max-model-len", type=int, default=524288)
+ap.add_argument("--max-model-len", type=int, default=380000)
 ap.add_argument("--bits-g", type=int, default=4); ap.add_argument("--bits-l", type=int, default=8)
+ap.add_argument("--kv-rot", type=int, default=1, help="global KV: randomized Hadamard rotation along head_dim before quantizing")
+ap.add_argument("--kv-ng", type=int, default=4, help="global KV: fp16 scale groups per 128-vector (1, 2, 4)")
+ap.add_argument("--kv-q16", type=int, default=1, help="global 4-bit KV: 16-level symmetric grid")
 ap.add_argument("--chunk", type=int, default=512)
 ap.add_argument("--served-name", default="inkling-2-small-exl3-v3")
+ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "0")), help="routed experts of the speculative verify through the b12x fused Trellis MoE (needs the b12x stack: cutlass-dsl + FlashInfer tree at I2_B12X_PATH)")
 args = ap.parse_args()
+if args.b12x:
+    os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
 SPEC = True               # speculative decoding is always on (every batch size); there is no plain-decode path
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
@@ -47,15 +53,21 @@ log(f"weights loaded in {time.time()-t0:.0f}s; GPU free {free0/2**30:.1f} GiB")
 # KV sizing: bytes per global page on this rank (target 4-bit + draft bf16)
 HKL = 8 // world
 def page_bytes():
-    tgt = 8 * 2 * PS * HKL * ((64 if args.bits_g == 4 else 128 if args.bits_g == 8 else 256) + (2 if args.bits_g != 16 else 0))
+    tgt = 8 * 2 * PS * HKL * ((64 if args.bits_g == 4 else 128 if args.bits_g == 8 else 256) + (2 * args.kv_ng if args.bits_g != 16 else 0))
     drf = PS * I2Draft.global_bytes_per_token(HKL) if SPEC else 0
     return tgt + drf
 fixed = (S + 1) * (40 * 2 * (1024 + 64) * HKL * ((64 if args.bits_l == 4 else 128) + 2) + 48 * 2 * 4096 * 16 * 2 // 1) * 0  # accounted by free-memory probe below
 pt_len = args.max_model_len // PS + 2
 # measure the fixed per-slot state by constructing the engine with a tiny page pool first
 eng = I2Engine(model, dev, rank, world, max_slots=S + 1, num_pages=8, page_size=PS, bits_g=args.bits_g, bits_l=args.bits_l,
-               max_pages_per_seq=pt_len)
+               max_pages_per_seq=pt_len, kv_rot=bool(args.kv_rot), kv_ng=args.kv_ng, kv_q16=bool(args.kv_q16),
+               max_rows=args.chunk)
 draft = I2Draft(args.model + "/mtp.safetensors", eng, dev, rank, world, S + 1, 8, PS) if SPEC else None
+if args.b12x:
+    from exllamav3.modules.inkling2_b12x import B12xMoE
+    tb = time.time()
+    eng.b12x = B12xMoE(model.layers, dev, sizes=[8 * b for b in (1, 2, 4, 8, 16) if b <= S])
+    log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-tb:.0f}s (tile {eng.b12x.tile})")
 free1, _ = torch.cuda.mem_get_info()
 budget = args.kv_gb * 2**30 if args.kv_gb > 0 else max(0.0, free1 - args.reserve_gb * 2**30)
 NP = max(16, int(budget // page_bytes()))
@@ -65,9 +77,10 @@ t = torch.tensor([NP], device=dev, dtype=torch.long); dist.all_reduce(t, op=dist
 for i, (kq, vq, ks, vs) in list(eng.kv.items()):
     if cfg.i2.is_global(i):
         shape = (NP, PS, HKL, kq.shape[-1])
+        sshape = shape[:-1] + ((args.kv_ng,) if args.kv_ng > 1 else ())
         eng.kv[i] = (torch.zeros(shape, dtype=kq.dtype, device=dev), torch.zeros(shape, dtype=vq.dtype, device=dev),
-                     None if ks is None else torch.zeros(shape[:-1], dtype=ks.dtype, device=dev),
-                     None if vs is None else torch.zeros(shape[:-1], dtype=vs.dtype, device=dev))
+                     None if ks is None else torch.zeros(sshape, dtype=ks.dtype, device=dev),
+                     None if vs is None else torch.zeros(sshape, dtype=vs.dtype, device=dev))
 if SPEC:
     draft.alloc(NP)
 torch.cuda.empty_cache()

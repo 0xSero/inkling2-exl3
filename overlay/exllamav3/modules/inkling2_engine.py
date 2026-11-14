@@ -13,6 +13,10 @@ from . import inkling2_ops as ops
 from ..architecture.inkling2 import Inkling2Model, Inkling2Layer
 
 RING_EXTRA = 64            # SWA ring headroom for speculative tokens beyond the window
+# The SWA ring must also hold every row of one multi-row call (prefill chunk) beyond the window: all rows' K/V are written
+# before any row's attention reads, so with window + 64 a 512-row chunk overwrote entries its own early rows still read
+# (KV16 KLD 0.01623 at chunk 512 vs 0.01295 at chunk 64). max_rows = the largest rows-per-sequence of any call.
+MAX_ROWS_DEFAULT = 512
 
 
 class Batch:
@@ -20,6 +24,7 @@ class Batch:
 
     def __init__(self, slot, pos, nprev, multi: bool, nsplit_g: int = 1, nsplit_l: int = 4, nafter = None):
         self.slot, self.pos, self.nprev = slot, pos, nprev
+        self.single = nafter is None
         if nafter is None:      # single sequence in the batch
             nafter = (slot.shape[0] - 1 - nprev).to(torch.int32)
         self.nafter = nafter
@@ -30,18 +35,36 @@ class Batch:
 
 class I2Engine:
     def __init__(self, model: Inkling2Model, device, rank: int, world: int, max_slots: int, num_pages: int,
-                 page_size: int = 64, bits_g: int = 4, bits_l: int = 8, max_pages_per_seq: int = 8192, embed_on_rank: int = 0):
+                 page_size: int = 64, bits_g: int = 4, bits_l: int = 8, max_pages_per_seq: int = 8192, embed_on_rank: int = 0,
+                 kv_rot: bool = False, kv_ng: int = 1, kv_q16: bool = False, max_rows: int = MAX_ROWS_DEFAULT):
+        """kv_rot / kv_ng / kv_q16 (global-layer KV only): randomized-Hadamard rotation of K/V/Q along head_dim before
+        quantizing, scale groups per 128-vector (fp16 scales), 16-level symmetric int4 grid"""
         self.model, self.cfg = model, model.config.i2
         self.device, self.rank, self.world = device, rank, world
         self.max_slots, self.num_pages, self.ps = max_slots, num_pages, page_size
         self.bits_g, self.bits_l = bits_g, bits_l
+        self.kv_rot = ops.make_kv_rotation(device) if kv_rot else None
+        self.kv_ng, self.kv_q16 = kv_ng, kv_q16
         self.layers = model.layers
         self.embed = model.embed
+        # vocab-parallel embedding: this rank keeps rows [rank*n, (rank+1)*n); lookups are summed over ranks (exact: one
+        # nonzero contribution per token). Frees (world-1)/world of the 1.85 GB bf16 table per GPU
+        V = model.embed.weight.shape[0]
+        assert V % world == 0
+        self.embed_n = V // world
+        if world > 1:
+            w = model.embed.weight[rank * self.embed_n:(rank + 1) * self.embed_n].clone()
+            model.embed.weight = None
+            torch.cuda.empty_cache()
+            self.embed_w = w
+        else:
+            self.embed_w = model.embed.weight
         self.head = model.head
         c = self.cfg
         self.Hl, self.Hkl = c.heads // world, c.kv_heads // world
         self.G = self.Hl // self.Hkl
-        self.ring = c.window + RING_EXTRA
+        self.ring = c.window + max(RING_EXTRA, max_rows)
+        self.max_rows = max_rows
         dev = device
         D = c.hidden
         self.blocks = None
@@ -60,14 +83,16 @@ class I2Engine:
             vq = torch.zeros(shape, dtype = ct(bits), device = dev)
             ks = vs = None
             if bits != 16:
-                ks = torch.zeros(shape[:-1], dtype = torch.half, device = dev)
-                vs = torch.zeros(shape[:-1], dtype = torch.half, device = dev)
+                sshape = shape[:-1] + ((kv_ng,) if c.is_global(i) and kv_ng > 1 else ())
+                ks = torch.zeros(sshape, dtype = torch.half, device = dev)
+                vs = torch.zeros(sshape, dtype = torch.half, device = dev)
             self.kv[i] = (kq, vq, ks, vs)
         z = lambda ch: torch.zeros((max_slots, ops.RC, ch), dtype = torch.bfloat16, device = dev)
         self.rings = {L.idx: (z(self.Hkl * 128), z(self.Hkl * 128), z(D), z(D)) for L in self.layers}
         self.page_table = torch.zeros((max_slots, max_pages_per_seq), dtype = torch.int32, device = dev)
         self.group = None
         self.moe_chunk_max = int(__import__('os').environ.get('I2_MOE_CHUNK_MAX', 192))
+        self.b12x = None          # optional inkling2_b12x.B12xMoE (b12x fused Trellis MoE for the prepared batch sizes)
         self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
 
     # ---- memory accounting
@@ -86,7 +111,13 @@ class I2Engine:
     # ---- embedding / head
     def embed_tokens(self, ids):
         c = self.cfg
-        e = self.embed.weight[ids]
+        if self.world == 1:
+            e = self.embed_w[ids]
+        else:
+            loc = ids - self.rank * self.embed_n
+            ok = (loc >= 0) & (loc < self.embed_n)
+            e = self.embed_w[loc.clamp(0, self.embed_n - 1)] * ok[:, None].to(self.embed_w.dtype)
+            dist.all_reduce(e)
         return ops_rms_norm(e, self.embed.norm, c.eps)
 
     def head_hidden(self, h, blocks):
@@ -142,7 +173,7 @@ class I2Engine:
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             ops.qkv_post(qb, kb, vb, L.kc_static, L.vc_static, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
                          q_out, rel_out, kq, vq, ks, vs, self.page_table, c, True, bits, rel_off, Hkl * 128, Hkl * 128,
-                         self.ring, self.ps, write_ring, Hkl, G)
+                         self.ring, self.ps, write_ring, Hkl, G, rot = self.kv_rot, ng = self.kv_ng, q16 = self.kv_q16)
             kraw, vraw = kb, vb
             Nq = qb
         else:
@@ -170,8 +201,9 @@ class I2Engine:
         pm = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
         pl = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
         po = torch.empty((T, Hl, nsplit, 128), dtype = torch.float32, device = h.device)
+        gq = dict(rot = self.kv_rot, ng = self.kv_ng, q16 = self.kv_q16) if L.is_global else {}
         ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
-                      (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G)
+                      (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, **gq)
         oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
         self.allreduce(oa)
 
@@ -188,7 +220,9 @@ class I2Engine:
 
         # routed experts (expert parallel), summed over ranks
         G = self.moe_group
-        if G < T <= self.moe_chunk_max:
+        if self.b12x is not None and self.b12x.supports(T):
+            moe = self.b12x.forward(L.idx, L.mlp, xm)
+        elif G < T <= self.moe_chunk_max:
             # the fused coop kernels take up to MAX_BSZN (64) rows per call: groups of `moe_group` rows
             moe = torch.cat([L.mlp.forward(xm[s:s + G], {}).view(-1, c.hidden).clone() for s in range(0, T, G)], 0)
         else:
@@ -210,6 +244,8 @@ class I2Engine:
     def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False):
         """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world].
         taps: optional [T, 8, D] bf16 buffer receiving the draft's target features (inputs of layers 5..41, final-norm output)"""
+        assert not (B.multi and B.single and B.T > self.max_rows), \
+            f"{B.T} rows of one sequence exceed the SWA ring headroom (max_rows {self.max_rows}): chunk the call"
         h = self.embed_tokens(ids)
         blocks = self.new_blocks(h.shape[0])
         for L in self.layers:
