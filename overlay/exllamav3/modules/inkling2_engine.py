@@ -18,8 +18,11 @@ RING_EXTRA = 64            # SWA ring headroom for speculative tokens beyond the
 class Batch:
     """Token batch descriptor (all int32 device tensors of length T; rows of a sequence contiguous, ascending)"""
 
-    def __init__(self, slot, pos, nprev, multi: bool, nsplit_g: int = 1, nsplit_l: int = 4):
+    def __init__(self, slot, pos, nprev, multi: bool, nsplit_g: int = 1, nsplit_l: int = 4, nafter = None):
         self.slot, self.pos, self.nprev = slot, pos, nprev
+        if nafter is None:      # single sequence in the batch
+            nafter = (slot.shape[0] - 1 - nprev).to(torch.int32)
+        self.nafter = nafter
         self.T = slot.shape[0]
         self.multi = multi              # more than one row per sequence (prefill chunk / speculative verify)
         self.nsplit_g, self.nsplit_l = nsplit_g, nsplit_l
@@ -64,6 +67,7 @@ class I2Engine:
         self.rings = {L.idx: (z(self.Hkl * 128), z(self.Hkl * 128), z(D), z(D)) for L in self.layers}
         self.page_table = torch.zeros((max_slots, max_pages_per_seq), dtype = torch.int32, device = dev)
         self.group = None
+        self.moe_chunk_max = int(__import__('os').environ.get('I2_MOE_CHUNK_MAX', 192))
 
     # ---- memory accounting
     def kv_bytes(self):
@@ -84,12 +88,35 @@ class I2Engine:
         e = self.embed.weight[ids]
         return ops_rms_norm(e, self.embed.norm, c.eps)
 
+    def head_hidden(self, h, blocks):
+        c = self.cfg
+        return ops.attn_res_norm(blocks, c.layers // c.block_layers, h, self.head.out_query[None], self.head.norm, c.eps)[0]
+
     def head_logits(self, h, blocks):
         """h: [T, D] bf16, blocks: [8, T, D]. Returns this rank's softcapped logits shard [T, V/world] fp32"""
         c = self.cfg
-        x = ops.attn_res_norm(blocks, c.layers // c.block_layers, h, self.head.out_query[None], self.head.norm, c.eps)[0]
+        x = self.head_hidden(h, blocks)
         z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
         return torch.tanh(z / c.final_cap) * c.final_cap
+
+    def global_argmax(self, z):
+        """argmax over the full (unpadded) vocabulary of vocab-sharded logits z [T, V/world]"""
+        c = self.cfg
+        n = z.shape[1]
+        valid = min(n, c.unpadded_vocab - self.rank * n)
+        if valid < n:
+            z = z.clone()
+            z[:, valid:] = float("-inf")
+        v, i = z.max(-1)
+        i = i + self.rank * n
+        if self.world == 1:
+            return i
+        vs = torch.empty((self.world,) + v.shape, dtype = v.dtype, device = v.device)
+        is_ = torch.empty((self.world,) + v.shape, dtype = i.dtype, device = v.device)
+        dist.all_gather_into_tensor(vs, v.contiguous())
+        dist.all_gather_into_tensor(is_, i.contiguous())
+        best = vs.argmax(0)
+        return is_.gather(0, best[None])[0]
 
     # ---- one decoder layer
     def layer(self, L: Inkling2Layer, h, blocks, B: Batch):
@@ -132,8 +159,8 @@ class I2Engine:
             kraw, vraw = kbv, vbv
             Nq = qb
         if B.multi:
-            ops.ring_write(kraw[:, :Hkl * 128], kring, B.slot, B.pos)
-            ops.ring_write(vraw[:, :Hkl * 128], vring, B.slot, B.pos)
+            ops.ring_write(kraw[:, :Hkl * 128], kring, B.slot, B.pos, B.nafter)
+            ops.ring_write(vraw[:, :Hkl * 128], vring, B.slot, B.pos, B.nafter)
         gate = Nq[:, gate_off:gate_off + Hl * 128]
         sink = Nq[:, sink_off:sink_off + Hl]
         R = torch.mm(rel_out.view(T * Hl, 16).float(), L.rel_proj.float()).view(T, Hl, c.rel_extent)
@@ -152,35 +179,48 @@ class I2Engine:
         ops.sconv(oa, L.attn_sconv, aring, B.slot, B.pos, B.nprev, 0, h = h, resid = resid, boundary = boundary,
                   write_ring = write_ring)
         if B.multi:
-            ops.ring_write(oa, aring, B.slot, B.pos)
+            ops.ring_write(oa, aring, B.slot, B.pos, B.nafter)
         if boundary:
             blocks[nb].copy_(h)
         nb_m = nb + 1 if boundary else nb
         xm = ops.attn_res_norm(blocks, nb_m, resid, L.mlp_query[None], L.mlp_norm, c.eps, out_f16 = True)[0]
 
         # routed experts (expert parallel), summed over ranks
-        moe = L.mlp.forward(xm, {})
+        if 8 < T <= self.moe_chunk_max:
+            # the fused bsz<=8 decode kernels beat the wide tiers by 3-6x per token: run groups of 8 rows
+            moe = torch.cat([L.mlp.forward(xm[s:s + 8], {}).view(-1, c.hidden).clone() for s in range(0, T, 8)], 0)
+        else:
+            moe = L.mlp.forward(xm, {})
         moe = moe.view(T, c.hidden)
         self.allreduce(moe)
         h_new = torch.empty_like(h)
         ops.sconv(moe, L.mlp_sconv, mring, B.slot, B.pos, B.nprev, 1, resid = resid, out = h_new, write_ring = write_ring)
         if B.multi:
-            ops.ring_write(moe, mring, B.slot, B.pos)
+            ops.ring_write(moe, mring, B.slot, B.pos, B.nafter)
         return h_new
 
     def new_blocks(self, T):
         c = self.cfg
         return torch.zeros((c.layers // c.block_layers, T, c.hidden), dtype = torch.bfloat16, device = self.device)
 
-    def forward(self, ids, B: Batch, stop_layer = None):
-        """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world]"""
+    TAP_LAYERS = (5, 11, 17, 23, 29, 35, 41)
+
+    def forward(self, ids, B: Batch, stop_layer = None, taps = None):
+        """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world].
+        taps: optional [T, 8, D] bf16 buffer receiving the draft's target features (inputs of layers 5..41, final-norm output)"""
         h = self.embed_tokens(ids)
         blocks = self.new_blocks(h.shape[0])
         for L in self.layers:
+            if taps is not None and L.idx in self.TAP_LAYERS:
+                taps[:, self.TAP_LAYERS.index(L.idx)].copy_(h)
             h = self.layer(L, h, blocks, B)
             if stop_layer is not None and L.idx == stop_layer:
                 return h
-        return self.head_logits(h, blocks)
+        x = self.head_hidden(h, blocks)
+        if taps is not None:
+            taps[:, 7].copy_(x)
+        z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
+        return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
 
 
 def ops_rms_norm(x, w, eps):

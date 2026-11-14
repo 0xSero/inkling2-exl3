@@ -164,7 +164,7 @@ def _hist(buf_ptr, stride_row, t, col0, ring_ptr, ring_slot_stride, ring_pos_str
 
 
 @triton.jit
-def _ring_write_kernel(src_ptr, stride_src, ring_ptr, ring_slot_stride, ring_pos_stride, slot_ptr, pos_ptr, C,
+def _ring_write_kernel(src_ptr, stride_src, ring_ptr, ring_slot_stride, ring_pos_stride, slot_ptr, pos_ptr, nafter_ptr, C,
                        BLOCK: tl.constexpr):
     t = tl.program_id(0)
     cb = tl.program_id(1)
@@ -172,16 +172,17 @@ def _ring_write_kernel(src_ptr, stride_src, ring_ptr, ring_slot_stride, ring_pos
     m = offs < C
     slot = tl.load(slot_ptr + t)
     pos = tl.load(pos_ptr + t)
+    na = tl.load(nafter_ptr + t)
+    m = m & (na < 16)
     x = tl.load(src_ptr + t * stride_src + offs, mask = m, other = 0.0)
     tl.store(ring_ptr + slot * ring_slot_stride + (pos % 16) * ring_pos_stride + offs, x.to(ring_ptr.dtype.element_ty), mask = m)
 
 
-def ring_write(src, ring, slot, pos):
-    """src: [T, C] (row stride arbitrary); ring: [slots, RC, C]; writes src[t] at ring[slot[t], pos[t] % RC]"""
-    if src.shape[0] > RC:      # long chunk = a single sequence: only the last RC positions can matter
-        src, slot, pos = src[-RC:], slot[-RC:], pos[-RC:]
+def ring_write(src, ring, slot, pos, nafter):
+    """src: [T, C] (row stride arbitrary); ring: [slots, RC, C]; writes src[t] at ring[slot[t], pos[t] % RC] for the last
+    RC rows of each sequence in the batch (nafter[t] = rows of the same sequence after row t)"""
     T, C = src.shape
-    _ring_write_kernel[(T, triton.cdiv(C, 1024))](src, src.stride(0), ring, ring.stride(0), ring.stride(1), slot, pos, C, BLOCK = 1024)
+    _ring_write_kernel[(T, triton.cdiv(C, 1024))](src, src.stride(0), ring, ring.stride(0), ring.stride(1), slot, pos, nafter, C, BLOCK = 1024)
 
 
 # ----------------------------------------------------------------------------------------------------------------------
