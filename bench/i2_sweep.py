@@ -1,4 +1,4 @@
-"""Inkling-2-Small EXL3 decode/prefill speed sweep (TP4 attention + EP4 experts). Launch via scripts/sweep.sh (torchrun, 4 ranks)."""
+"""Inkling-2-Small EXL3 decode/prefill speed sweep (TP4 attention; experts EP2xTP2 by default, I2_EP_LAYOUT=ep4 for EP4). Launch via scripts/sweep.sh (torchrun, 4 ranks)."""
 import os, sys, time, json, argparse, importlib.util
 import torch, torch.distributed as dist
 from exllamav3.model.config import Config
@@ -8,7 +8,7 @@ from exllamav3.modules.inkling2_draft import I2Draft
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-4bpw"))
-ap.add_argument("--concurrency", default=os.environ.get("CONCURRENCY", "1,4,8,16"))
+ap.add_argument("--concurrency", default=os.environ.get("CONCURRENCY", "1,2,4,8,16"))
 ap.add_argument("--repeats", type=int, default=int(os.environ.get("REPEATS", "3")))
 ap.add_argument("--steps", type=int, default=int(os.environ.get("STEPS", "128")), help="tokens generated per sequence")
 ap.add_argument("--prompt", type=int, default=int(os.environ.get("PROMPT", "256")))
@@ -19,6 +19,7 @@ ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "1")),
 ap.add_argument("--kv-rot", type=int, default=int(os.environ.get("KV_ROT", "1")), help="global 4-bit KV: Hadamard rotation (server default)")
 ap.add_argument("--kv-ng", type=int, default=int(os.environ.get("KV_NG", "4")), help="global 4-bit KV: scale groups per 128-vector")
 ap.add_argument("--kv-q16", type=int, default=int(os.environ.get("KV_Q16", "1")), help="global 4-bit KV: 16-level grid")
+ap.add_argument("--spec-k", default=os.environ.get("SPEC_K", "1:4,2:3,4:2,8:2,16:2"), help="draft length per batch size: one K (1..7) or a B:K map (server --spec-k)")
 ap.add_argument("--out", default=os.environ.get("RESULTS_DIR", "/models/results"))
 a = ap.parse_args()
 if a.b12x:
@@ -31,10 +32,20 @@ def log(*x):
     if rank == 0: print(time.strftime("%H:%M:%S"), *x, flush=True)
 
 
+_SK = {int(k): int(v) for k, v in (x.split(":") for x in a.spec_k.split(","))} if ":" in a.spec_k else None
+def spec_k(B):
+    """draft length for batch size B (the smallest mapped size >= B, else the largest), as in the server"""
+    if _SK is None: return int(a.spec_k)
+    ks = sorted(_SK)
+    return _SK[next((k for k in ks if k >= B), ks[-1])]
+
 spec_on = True   # speculative decoding is always on; there is no plain-decode mode
 cfg = Config.from_directory(a.model_dir)
 model = Model.from_config(cfg, tp_rank=rank, tp_size=world)
 model.layers = model.layers[:a.layers]
+if a.b12x:
+    from exllamav3.modules.inkling2_b12x import prepare_model, attach_moe
+    prepare_model(model)                      # EP2xTP2 (default layout) loads its own expert shards
 t0 = time.time()
 model.embed.load(dev)
 for L in model.layers: L.load(dev)
@@ -53,9 +64,8 @@ if spec_on:
     draft = I2Draft(os.path.join(a.model_dir, "mtp.safetensors"), eng, dev, rank, world, B_MAX, B_MAX * PP + 8, 64)
     log("draft loaded", f"{torch.cuda.memory_allocated()/2**30:.1f} GB/rank")
 if a.b12x:
-    from exllamav3.modules.inkling2_b12x import B12xMoE
     t1 = time.time()
-    eng.b12x = B12xMoE(model.layers, dev, sizes=sorted(set(8 * b for b in Bs)))
+    attach_moe(eng, model, a.model_dir, cfg, dev, rank, world, sizes=sorted(set((spec_k(b) + 1) * b for b in Bs)))
     log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-t1:.0f}s (tile {eng.b12x.tile})")
 V = cfg.i2.unpadded_vocab
 
@@ -94,10 +104,11 @@ def decode_spec(B, N, first):
     slot = torch.arange(B, dtype=torch.int32, device=dev)
     anchor = torch.cat([f[0] for f in first]); feats_last = torch.cat([f[1] for f in first])
     P = torch.full((B,), a.prompt, dtype=torch.int32, device=dev)
-    d = draft.draft(anchor, slot, P, feats_last).clone()
-    ar8 = torch.arange(8, dtype=torch.int32, device=dev)
-    slot8 = slot.repeat_interleave(8); nprev = ar8.repeat(B); nafter = (7 - nprev).to(torch.int32)
-    taps = torch.empty((B * 8, 8, 4608), dtype=torch.bfloat16, device=dev)
+    K = spec_k(B); R = K + 1
+    d = draft.draft(anchor, slot, P, feats_last, K=K).clone()
+    ar8 = torch.arange(R, dtype=torch.int32, device=dev)
+    slot8 = slot.repeat_interleave(R); nprev = ar8.repeat(B); nafter = (K - nprev).to(torch.int32)
+    taps = torch.empty((B * R, 8, 4608), dtype=torch.bfloat16, device=dev)
     arB = torch.arange(B, device=dev)
     n_out = torch.zeros(B, dtype=torch.long, device=dev)
     def step():
@@ -105,15 +116,15 @@ def decode_spec(B, N, first):
         pos = (P[:, None] + ar8[None]).reshape(-1).to(torch.int32)
         bt = Batch(slot8, pos, nprev, True, nsplit_g=4, nsplit_l=4, nafter=nafter)
         z = eng.forward(ids.reshape(-1), bt, taps=taps)
-        g = eng.global_argmax(z).view(B, 8)
-        n = (d == g[:, :7]).int().cumprod(1).sum(1)
+        g = eng.global_argmax(z).view(B, R)
+        n = (d == g[:, :K]).int().cumprod(1).sum(1)
         draft.store_context(taps, slot8, pos)
         newanchor = g.gather(1, n[:, None])[:, 0]
         n_out.copy_(n)
         P.add_((n + 1).to(torch.int32))
         anchor.copy_(newanchor)
-        f_last = taps.view(B, 8, 8, 4608)[arB, n]
-        d.copy_(draft.draft(anchor, slot, P, f_last))
+        f_last = taps.view(B, R, 8, 4608)[arB, n]
+        d.copy_(draft.draft(anchor, slot, P, f_last, K=K))
     graph = None
     if a.graph:
         P0, a0, d0 = P.clone(), anchor.clone(), d.clone()
@@ -133,7 +144,7 @@ def decode_spec(B, N, first):
         gn = n_out.cpu() + 1
         produced += gn; emitted += int(gn.sum()); steps += 1
     torch.cuda.synchronize(); dt = time.time() - t0
-    return dict(steps=steps, tokens=emitted, dt=dt, accept=emitted / (steps * B))
+    return dict(steps=steps, tokens=emitted, dt=dt, accept=emitted / (steps * B), spec_k=K)
 
 results = []
 for B in Bs:
@@ -148,21 +159,22 @@ for B in Bs:
     med = lambda k: sorted(x[k] for x in runs)[len(runs) // 2]
     acc = [x["accept"] for x in runs if x["accept"] is not None]
     results.append(dict(concurrency=B, decode_tok_s=med("decode_tok_s"), prefill_tok_s=med("prefill_tok_s"),
-                        steps_s=med("steps_s"), accept_len=(sorted(acc)[len(acc) // 2] if acc else None),
+                        steps_s=med("steps_s"), spec_k=spec_k(B), accept_len=(sorted(acc)[len(acc) // 2] if acc else None),
                         decode_runs=[x["decode_tok_s"] for x in runs]))
     log(f"c{B}: decode {results[-1]['decode_tok_s']:.1f} tok/s, accept {results[-1]['accept_len']}, prefill {results[-1]['prefill_tok_s']:.0f} tok/s")
 
 if rank == 0:
     meta = dict(date=time.strftime("%Y-%m-%d %H:%M:%S"), model_dir_name=os.path.basename(a.model_dir.rstrip("/")),
                 prompt=a.prompt, tokens_per_seq=a.steps, repeats=a.repeats, cuda_graphs=bool(a.graph),
-                spec="on", b12x=bool(a.b12x), kv=dict(bits_g=4, bits_l=8, rot=a.kv_rot, ng=a.kv_ng, q16=a.kv_q16), gpus=[torch.cuda.get_device_name(i) for i in range(world)])
+                spec="on", spec_k=a.spec_k, b12x=bool(a.b12x),
+                ep_layout=os.environ.get("I2_EP_LAYOUT", "ep4"), draft_fp8=os.environ.get("I2_DRAFT_FP8", "0") == "1", kv=dict(bits_g=4, bits_l=8, rot=a.kv_rot, ng=a.kv_ng, q16=a.kv_q16), gpus=[torch.cuda.get_device_name(i) for i in range(world)])
     lab = "speculative decoding (DSpark/MTP)" + (", b12x verify MoE" if a.b12x else "")
     lines = [f"### Inkling-2-Small EXL3 sweep - {lab}", "",
              f"{a.prompt}-token prompts, {a.steps} generated tokens/seq, median of {a.repeats} repeats, CUDA graphs={'on' if a.graph else 'off'}", "",
-             "| concurrency | decode tok/s | accept len | steps/s | prefill tok/s |", "|---|---|---|---|---|"]
+             "| concurrency | draft K | decode tok/s | accept len | steps/s | prefill tok/s |", "|---|---|---|---|---|---|"]
     for r in results:
         al = f"{r['accept_len']:.2f}" if r["accept_len"] else "n/a"
-        lines.append(f"| c{r['concurrency']} | {r['decode_tok_s']:.1f} | {al} | {r['steps_s']:.1f} | {r['prefill_tok_s']:.0f} |")
+        lines.append(f"| c{r['concurrency']} | {r['spec_k']} | {r['decode_tok_s']:.1f} | {al} | {r['steps_s']:.1f} | {r['prefill_tok_s']:.0f} |")
     print("\n" + "\n".join(lines) + "\n", flush=True)
     try:
         os.makedirs(a.out, exist_ok=True)

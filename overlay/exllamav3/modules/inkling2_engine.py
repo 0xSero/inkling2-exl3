@@ -10,6 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from . import inkling2_ops as ops
+from .inkling2_gemm import skinny_mm
 from ..architecture.inkling2 import Inkling2Model, Inkling2Layer
 
 RING_EXTRA = 64            # SWA ring headroom for speculative tokens beyond the window
@@ -92,6 +93,11 @@ class I2Engine:
         self.page_table = torch.zeros((max_slots, max_pages_per_seq), dtype = torch.int32, device = dev)
         self.group = None
         self.moe_chunk_max = int(__import__('os').environ.get('I2_MOE_CHUNK_MAX', 192))
+        # dtype of the two per-layer all-reduces (attention o_proj partials, routed-expert partials): the sums are
+        # rounded to bf16 by the consuming sconv anyway; fp16 halves the PCIe bytes vs fp32 with 3 more mantissa bits than bf16
+        self.ar_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[__import__('os').environ.get('I2_AR_DTYPE', 'fp16')]
+        self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= 64 projections
+        self.rel_fused = __import__('os').environ.get('I2_REL_FUSED', '1') == '1'   # relative bias inside the attention kernel
         self.b12x = None          # optional inkling2_b12x.B12xMoE (b12x fused Trellis MoE for the prepared batch sizes)
         self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
 
@@ -102,9 +108,17 @@ class I2Engine:
             tot += sum(x.numel() * x.element_size() for x in t if x is not None)
         return tot
 
+    def mm(self, x, w):
+        """x [T, K] @ w[N, K]^T in bf16 (skinny Triton GEMM for decode/verify-sized T)"""
+        if self.skinny and x.shape[0] <= 64:
+            return skinny_mm(x, w, out_dtype = torch.bfloat16)
+        return torch.mm(x, w.t())
+
     # ---- collectives
+    _NO_AR = __import__('os').environ.get('I2_NO_AR', '0') == '1'      # timing diagnostics only: outputs are wrong
+
     def allreduce(self, x):
-        if self.world > 1:
+        if self.world > 1 and not self._NO_AR:
             dist.all_reduce(x)
         return x
 
@@ -167,9 +181,9 @@ class I2Engine:
         # attention input(s) and projections
         if L.is_global:
             xs = ops.attn_res_norm(blocks, nb, h, L.attn_query, L.qkv_norms, c.eps)        # [3, T, D]
-            qb = torch.mm(xs[0], L.wq_cat.t())
-            kb = torch.mm(xs[1], L.wk_cat.t())
-            vb = torch.mm(xs[2], L.wv_cat.t())
+            qb = self.mm(xs[0], L.wq_cat)
+            kb = self.mm(xs[1], L.wk_cat)
+            vb = self.mm(xs[2], L.wv_cat)
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             ops.qkv_post(qb, kb, vb, L.kc_static, L.vc_static, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
                          q_out, rel_out, kq, vq, ks, vs, self.page_table, c, True, bits, rel_off, Hkl * 128, Hkl * 128,
@@ -181,7 +195,7 @@ class I2Engine:
                 x = ops.attn_res_norm(blocks, 0, h, torch.zeros((1, c.hidden), device = h.device), L.attn_norm, c.eps)
             else:
                 x = ops.attn_res_norm(blocks, nb, h, L.attn_query[None], L.attn_norm, c.eps)
-            qb = torch.mm(x[0], L.wqkv.t())
+            qb = self.mm(x[0], L.wqkv)
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             koff = sink_off + Hl
             kbv, vbv = qb[:, koff:], qb[:, koff + Hkl * 128:]
@@ -195,7 +209,14 @@ class I2Engine:
             ops.ring_write(vraw[:, :Hkl * 128], vring, B.slot, B.pos, B.nafter)
         gate = Nq[:, gate_off:gate_off + Hl * 128]
         sink = Nq[:, sink_off:sink_off + Hl]
-        R = torch.mm(rel_out.view(T * Hl, 16).float(), L.rel_proj.float()).view(T, Hl, c.rel_extent)
+        if self.rel_fused:
+            R = None
+            if not hasattr(L, "rel_proj_f32"):
+                L.rel_proj_f32 = L.rel_proj.float().contiguous()
+            relarg = (rel_out, L.rel_proj_f32)
+        else:
+            R = torch.mm(rel_out.view(T * Hl, 16).float(), L.rel_proj.float()).view(T, Hl, c.rel_extent)
+            relarg = None
         o = torch.empty((T, Hl * 128), dtype = torch.bfloat16, device = h.device)
         nsplit = B.nsplit_g if L.is_global else B.nsplit_l
         pm = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
@@ -203,8 +224,13 @@ class I2Engine:
         po = torch.empty((T, Hl, nsplit, 128), dtype = torch.float32, device = h.device)
         gq = dict(rot = self.kv_rot, ng = self.kv_ng, q16 = self.kv_q16) if L.is_global else {}
         ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
-                      (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, **gq)
-        oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
+                      (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, rel = relarg, **gq)
+        if self.skinny and T <= 64:
+            oa = skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
+        else:
+            oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
+            if self.ar_dtype != torch.float32:
+                oa = oa.to(self.ar_dtype)
         self.allreduce(oa)
 
         # post-attention conv + residual, attention residual for the MLP input
@@ -221,13 +247,15 @@ class I2Engine:
         # routed experts (expert parallel), summed over ranks
         G = self.moe_group
         if self.b12x is not None and self.b12x.supports(T):
-            moe = self.b12x.forward(L.idx, L.mlp, xm)
+            moe = self.b12x.forward(L.idx, L.mlp, xm, out_dtype = self.ar_dtype)
         elif G < T <= self.moe_chunk_max:
             # the fused coop kernels take up to MAX_BSZN (64) rows per call: groups of `moe_group` rows
             moe = torch.cat([L.mlp.forward(xm[s:s + G], {}).view(-1, c.hidden).clone() for s in range(0, T, G)], 0)
         else:
             moe = L.mlp.forward(xm, {})
         moe = moe.view(T, c.hidden)
+        if moe.dtype != self.ar_dtype:
+            moe = moe.to(self.ar_dtype)
         self.allreduce(moe)
         h_new = torch.empty_like(h)
         ops.sconv(moe, L.mlp_sconv, mring, B.slot, B.pos, B.nprev, 1, resid = resid, out = h_new, write_ring = write_ring)

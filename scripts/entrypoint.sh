@@ -17,5 +17,5 @@ case "$cmd" in
   download) fetch ;;
   shell|bash) exec bash ;;
   check) exec python /opt/inkling2/scripts/check_imports.py ;;
-  *) echo "usage: sweep | serve | download | check | shell   (env: MODEL_DIR PORT CONCURRENCY REPEATS STEPS PROMPT I2_B12X; serve args: --max-model-len --slots --bits-g --bits-l --kv-rot --kv-ng --kv-q16 --kv-gb)"; exit 1 ;;
+  *) echo "usage: sweep | serve | download | check | shell   (env: MODEL_DIR PORT CONCURRENCY REPEATS STEPS PROMPT SPEC_K I2_B12X I2_EP_LAYOUT I2_DRAFT_FP8; serve args: --max-model-len --slots --spec-k --burst --bits-g --bits-l --kv-rot --kv-ng --kv-q16 --kv-gb)"; exit 1 ;;
 esac

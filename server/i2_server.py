@@ -23,6 +23,8 @@ ap.add_argument("--kv-gb", type=float, default=0.0, help="KV cache budget per GP
 ap.add_argument("--reserve-gb", type=float, default=2.0, help="free memory kept for workspace when sizing KV automatically (measured peak extra use: 0.6 GiB)")
 ap.add_argument("--max-model-len", type=int, default=380000)
 ap.add_argument("--bits-g", type=int, default=4); ap.add_argument("--bits-l", type=int, default=8)
+ap.add_argument("--burst", type=int, default=1, help="max back-to-back speculative steps per scheduler round (1 = one host sync per step)")
+ap.add_argument("--spec-k", default="1:4,2:3,4:2,8:2,16:2", help="draft length per decode bucket: one K (1..7) or a map like 1:2,2:2,4:2,8:3,16:4")
 ap.add_argument("--kv-rot", type=int, default=1, help="global KV: randomized Hadamard rotation along head_dim before quantizing")
 ap.add_argument("--kv-ng", type=int, default=4, help="global KV: fp16 scale groups per 128-vector (1, 2, 4)")
 ap.add_argument("--kv-q16", type=int, default=1, help="global 4-bit KV: 16-level symmetric grid")
@@ -33,6 +35,12 @@ args = ap.parse_args()
 if args.b12x:
     os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
 SPEC = True               # speculative decoding is always on (every batch size); there is no plain-decode path
+_SK = {int(k): int(v) for k, v in (x.split(":") for x in args.spec_k.split(","))} if ":" in args.spec_k else None
+def spec_k(B):
+    """draft length of decode bucket B (the smallest mapped bucket >= B, else the largest)"""
+    if _SK is None: return int(args.spec_k)
+    ks = sorted(_SK)
+    return _SK[next((k for k in ks if k >= B), ks[-1])]
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
 dist.init_process_group("nccl", device_id=dev)
@@ -42,6 +50,9 @@ def log(*x):
 # ---------------------------------------------------------------------------------------------------------- load
 cfg = Config.from_directory(args.model)
 model = Model.from_config(cfg, tp_rank=rank, tp_size=world)
+if args.b12x:
+    from exllamav3.modules.inkling2_b12x import prepare_model, attach_moe
+    prepare_model(model)
 t0 = time.time()
 model.embed.load(dev)
 for L in model.layers: L.load(dev)
@@ -66,7 +77,7 @@ draft = I2Draft(args.model + "/mtp.safetensors", eng, dev, rank, world, S + 1, 8
 if args.b12x:
     from exllamav3.modules.inkling2_b12x import B12xMoE
     tb = time.time()
-    eng.b12x = B12xMoE(model.layers, dev, sizes=[8 * b for b in (1, 2, 4, 8, 16) if b <= S])
+    attach_moe(eng, model, args.model, cfg, dev, rank, world, sizes=sorted(set((spec_k(b) + 1) * b for b in (1, 2, 4, 8, 16) if b <= S)))
     log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-tb:.0f}s (tile {eng.b12x.tile})")
 free1, _ = torch.cuda.mem_get_info()
 budget = args.kv_gb * 2**30 if args.kv_gb > 0 else max(0.0, free1 - args.reserve_gb * 2**30)
@@ -89,6 +100,9 @@ log(f"KV pages: {NP} x {PS} = {NP*PS:,} tokens (per GPU {NP*page_bytes()/2**30:.
 # ---------------------------------------------------------------------------------------------------------- state
 BUCKETS = [b for b in (1, 2, 4, 8, 16) if b <= S]
 DUMMY = S                               # scratch slot for padded rows; owns page 0
+PROF_AT = int(os.environ.get("I2_PROFILE_AT", "0")); PROF_STEP = 0
+BURST_EMIT = torch.zeros((max(1, args.burst), S + 1, 8), dtype=torch.long, device=dev)
+BURST_N = torch.zeros((max(1, args.burst), S + 1), dtype=torch.long, device=dev)
 anchor_all = torch.zeros(S + 1, dtype=torch.long, device=dev)
 d_all = torch.zeros((S + 1, 7), dtype=torch.long, device=dev)
 P_all = torch.zeros(S + 1, dtype=torch.int32, device=dev)
@@ -111,39 +125,43 @@ class Bucket:
     def __init__(self, B, spec):
         self.B = B
         self.spec = spec and SPEC
+        self.K = spec_k(B)
+        R = self.K + 1
         self.slots = torch.full((B,), DUMMY, dtype=torch.int32, device=dev)
-        self.emit = torch.zeros((B, 8), dtype=torch.long, device=dev)
+        self.emit = torch.zeros((B, R), dtype=torch.long, device=dev)
         self.n = torch.zeros(B, dtype=torch.long, device=dev)
-        self.taps = torch.empty((B * 8 if self.spec else B, 8, 4608), dtype=torch.bfloat16, device=dev) if SPEC else None
+        self.taps = torch.empty((B * R if self.spec else B, 8, 4608), dtype=torch.bfloat16, device=dev) if SPEC else None
         self.graph = None
 
     @torch.no_grad()
     def step(self):
-        B = self.B
+        B, K = self.B, self.K
+        R = K + 1
+        arR = ar8[:R]
         sl = self.slots.long()
-        slot8 = self.slots.repeat_interleave(8)
-        nprev = ar8.repeat(B); nafter = (7 - nprev).to(torch.int32)
+        slot8 = self.slots.repeat_interleave(R)
+        nprev = arR.repeat(B); nafter = (K - nprev).to(torch.int32)
         P = P_all[sl]
         anchor = anchor_all[sl]
-        temps = temp_all[sl].repeat_interleave(8)
-        pos = (P[:, None] + ar8[None]).reshape(-1).to(torch.int32)
+        temps = temp_all[sl].repeat_interleave(R)
+        pos = (P[:, None] + arR[None]).reshape(-1).to(torch.int32)
         nsplit_g = 8
         if self.spec:
-            d = d_all[sl]
+            d = d_all[sl][:, :K]
             ids = torch.cat([anchor[:, None], d], 1).reshape(-1)
             bt = Batch(slot8, pos, nprev, True, nsplit_g=nsplit_g, nsplit_l=4, nafter=nafter)
             z = eng.forward(ids, bt, taps=self.taps)
-            g = sample_rows(z, temps).view(B, 8)
-            n = (d == g[:, :7]).int().cumprod(1).sum(1)
+            g = sample_rows(z, temps).view(B, R)
+            n = (d == g[:, :K]).int().cumprod(1).sum(1)
             draft.store_context(self.taps, slot8, pos)
             newanchor = g.gather(1, n[:, None])[:, 0]
             emit = torch.cat([d, g[:, :1]], 1)
             emit.scatter_(1, n[:, None], newanchor[:, None])
             self.emit.copy_(emit); self.n.copy_(n)
             Pn = P + (n + 1).to(torch.int32)
-            f_last = self.taps.view(B, 8, 8, 4608)[torch.arange(B, device=dev), n]
-            dn = draft.draft(newanchor, self.slots, Pn, f_last, nsplit_g=nsplit_g)
-            anchor_all[sl] = newanchor; P_all[sl] = Pn; d_all[sl] = dn
+            f_last = self.taps.view(B, R, 8, 4608)[torch.arange(B, device=dev), n]
+            dn = draft.draft(newanchor, self.slots, Pn, f_last, nsplit_g=nsplit_g, K=K)
+            anchor_all[sl] = newanchor; P_all[sl] = Pn; d_all[sl, :K] = dn
         else:
             bt = Batch(self.slots, P, torch.zeros(B, dtype=torch.int32, device=dev), False, nsplit_g=nsplit_g, nsplit_l=4)
             z = eng.forward(anchor, bt, taps=self.taps)
@@ -173,7 +191,7 @@ t0 = time.time()
 with torch.no_grad():
     for B in sbuckets:
         capture(sbuckets[B])
-log(f"speculative graphs captured for buckets {BUCKETS} in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
+log(f"speculative graphs captured for buckets {BUCKETS} (draft K {[spec_k(b) for b in BUCKETS]}) in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
 
 # ---------------------------------------------------------------------------------------------------------- commands
 OP_NOOP, OP_PREFILL, OP_DECODE, OP_STOP = 0, 1, 2, 9
@@ -223,14 +241,33 @@ def do_prefill(h, pay, fpay):
 
 @torch.no_grad()
 def do_decode(h, pay, fpay):
-    B, nact = h[1], h[2]
+    """h[4] = number of back-to-back speculative steps (burst; one host sync for all of them)"""
+    B, nact, nsteps = h[1], h[2], max(1, h[4])
     b = sbuckets[B] if h[3] else buckets[B]
     sl = pay[:nact].to(torch.int32)
     b.slots.fill_(DUMMY); b.slots[:nact] = sl
     P_all[DUMMY] = 0
-    b.graph.replay()
+    R = b.emit.shape[1]
+    global PROF_STEP
+    PROF_STEP += nsteps
+    if PROF_AT and PROF_AT <= PROF_STEP < PROF_AT + nsteps:
+        # diagnostics: 20 replays on every rank with all rows on the dummy slot (live sequences untouched)
+        from torch.profiler import profile, ProfilerActivity
+        saved = b.slots.clone(); b.slots.fill_(DUMMY)
+        torch.cuda.synchronize()
+        with profile(activities=[ProfilerActivity.CUDA]) as pr:
+            for _ in range(20):
+                P_all[DUMMY] = 0; b.graph.replay()
+            torch.cuda.synchronize()
+        P_all[DUMMY] = 0; b.slots.copy_(saved)
+        if rank == 0:
+            print(f"PROFILE bucket {B} (20 dummy-slot replays):\n" + pr.key_averages().table(sort_by="cuda_time_total", row_limit=40, max_name_column_width=80), flush=True)
+    for i in range(nsteps):
+        b.graph.replay()
+        if rank == 0:
+            BURST_EMIT[i, :B, :R].copy_(b.emit); BURST_N[i, :B].copy_(b.n)
     if rank == 0:
-        return b.emit.cpu(), b.n.cpu()
+        return BURST_EMIT[:nsteps, :B, :R].cpu(), BURST_N[:nsteps, :B].cpu()
     return None
 
 def worker_loop():
@@ -328,16 +365,25 @@ def scheduler():
             nb = len(slots)
             use_spec = True
             B = next(b for b in (sbuckets if use_spec else buckets) if b >= nb)
-            h = [OP_DECODE, B, nb, int(use_spec), 0, 0, nb, 0]
+            # burst of back-to-back steps when nothing waits for admission/prefill; bounded by every active request's
+            # page headroom (24 positions past max_tokens) so overshooting steps never write outside its pages
+            R = spec_k(B) + 1
+            nsteps = 1
+            if not prefilling and (pending.empty() or not free_slots) and args.burst > 1:
+                head = min((r.max_tokens + 24 - R - len(r.gen)) // R for r in active.values())
+                nsteps = max(1, min(args.burst, head))
+            h = [OP_DECODE, B, nb, int(use_spec), nsteps, 0, nb, 0]
             td0 = time.time()
             bcast(h, slots)
             emit_t, n_t = do_decode(HDR.tolist(), PAY[:nb], None)
-            STATS['dec_steps'] += 1; STATS['dec_time'] += time.time() - td0; STATS['dec_rows'] += nb; STATS['dec_tok'] += (int(n_t[:nb].sum()) + nb) if use_spec else nb
-            for i, s in enumerate(slots):
-                req = active.get(s)
-                if req is None: continue
-                k = int(n_t[i]) + 1 if use_spec else 1
-                handle_tokens(req, emit_t[i, :k].tolist())
+            STATS['dec_steps'] += nsteps; STATS['dec_time'] += time.time() - td0; STATS['dec_rows'] += nb * nsteps
+            STATS['dec_tok'] += int(n_t[:, :nb].sum()) + nb * nsteps
+            for st in range(nsteps):
+                for i, s in enumerate(slots):
+                    req = active.get(s)
+                    if req is None: continue
+                    k = int(n_t[st, i]) + 1
+                    handle_tokens(req, emit_t[st, i, :k].tolist())
             did = True
         if not did:
             time.sleep(0.002)

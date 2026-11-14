@@ -136,6 +136,17 @@ class I2Draft:
             L["wgu"] = torch.cat([sh(g(p + "mlp.gate_proj.weight")), sh(g(p + "mlp.up_proj.weight"))], 0).contiguous()
             L["wd"] = sh(g(p + "mlp.down_proj.weight"), 1)
             self.L.append(L)
+        # FP8 weight-only (e4m3, per-output-row scale) for the block-forward projections (M = 8 x batch rows <= 128)
+        self.fp8 = __import__("os").environ.get("I2_DRAFT_FP8", "0") == "1"
+        if self.fp8:
+            from .inkling2_gemm import quant_fp8_rows
+            for L in self.L:
+                for k in ("wqkv", "wo", "wgu", "wd"):
+                    L[k + "_q"], L[k + "_s"] = quant_fp8_rows(L[k])
+                    del L[k]
+            torch.cuda.empty_cache()
+        self.markov_fused = __import__("os").environ.get("I2_MARKOV_FUSED", "1") == "1"
+        self._mstep = {}
         self.norm = g("norm.weight")
         self.mask_embed = g("mask_embed")
         self.fuse_alpha = torch.softmax(g("fuse_weight").float(), -1)          # [6, 8]
@@ -208,6 +219,7 @@ class I2Draft:
         full = feats, slot, pos
         for i, L in enumerate(self.L):
             feats, slot, pos = full
+            R = feats.shape[0]
             if i in self.LOCAL and R > RINGD:        # long single-sequence chunk: only the last RINGD rows can be read
                 feats, slot, pos = feats[-RINGD:], slot[-RINGD:], pos[-RINGD:]
             R = feats.shape[0]
@@ -235,6 +247,12 @@ class I2Draft:
         _dattn_combine[(B * BLOCK * HL,)](pm, pl, po, o, DH = 128, NSPLIT = nsplit)
         return o
 
+    def _mm(self, x, L, k):
+        if self.fp8:
+            from .inkling2_gemm import skinny_mm
+            return skinny_mm(x, L[k + "_q"], L[k + "_s"], out_dtype = torch.bfloat16)
+        return torch.mm(x, L[k].t())
+
     def block_forward(self, anchor_tok, slot, pa, nsplit_g = 4, nsplit_l = 4):
         """anchor_tok [B] long, slot [B] int32, pa [B] int32 (anchor positions). Returns hidden [B*8, D] bf16"""
         B = slot.shape[0]
@@ -248,7 +266,7 @@ class I2Draft:
         res = x
         xn = rms(x, self.L[0]["ln_in"])
         for i, L in enumerate(self.L):
-            qkv = torch.mm(xn, L["wqkv"].t())
+            qkv = self._mm(xn, L, "wqkv")
             q = qkv[:, : self.Hl * 128].reshape(-1, 128)
             k = qkv[:, self.Hl * 128: (self.Hl + self.Hkl) * 128].reshape(-1, 128)
             v = qkv[:, (self.Hl + self.Hkl) * 128:]
@@ -257,38 +275,47 @@ class I2Draft:
             rows = self._cache_rows(i, slot_r, pos)
             self._write(i, rows, k, v.reshape(-1, self.Hkl, 128))
             o = self.attention(i, q, slot, pa, nsplit_l if i in self.LOCAL else nsplit_g)
-            o = torch.mm(o, L["wo"].t())
+            o = self._mm(o, L, "wo")
             eng.allreduce(o)
             res = (res.float() + o.float()).to(torch.bfloat16)
             xn = rms(res, L["ln_post"])
-            gu = torch.mm(xn, L["wgu"].t())
+            gu = self._mm(xn, L, "wgu")
             g, u = gu.float().chunk(2, -1)
             act = (torch.nn.functional.silu(g) * u).to(torch.bfloat16)
-            y = torch.mm(act, L["wd"].t())
+            y = self._mm(act, L, "wd")
             eng.allreduce(y)
             res = (res.float() + y.float()).to(torch.bfloat16)
             xn = rms(res, self.L[i + 1]["ln_in"] if i + 1 < 5 else self.norm)
         return xn
 
-    def draft(self, anchor_tok, slot, pa, f_feats, nsplit_g = 4, nsplit_l = 4):
-        """Draft 7 tokens for B sequences. f_feats: [B, 8, D] target features of the last committed row.
-        Returns tokens [B, 7] (int64)"""
+    def draft(self, anchor_tok, slot, pa, f_feats, nsplit_g = 4, nsplit_l = 4, K = 7):
+        """Draft K (<= 7) tokens for B sequences. f_feats: [B, 8, D] target features of the last committed row.
+        Returns tokens [B, K] (int64). The block forward always runs the full 8-row block (same numerics for any K)"""
         B = slot.shape[0]
         eng = self.eng
-        hid = self.block_forward(anchor_tok, slot, pa, nsplit_g, nsplit_l).view(B, BLOCK, -1)[:, 1:]       # [B, 7, D]
-        hid = hid.reshape(B * 7, -1)
-        base = torch.mm(hid, eng.head.unembed.t())                                                           # bf16 [B*7, V/w]
+        hid = self.block_forward(anchor_tok, slot, pa, nsplit_g, nsplit_l).view(B, BLOCK, -1)[:, 1:K + 1]   # [B, K, D]
+        hid = hid.reshape(B * K, -1)
+        base = torch.mm(hid, eng.head.unembed.t())                                                           # bf16 [B*K, V/w]
         f_rnn = self.mix(f_feats, 5, self.m_dflare)                                                          # [B, D]
         Wc = self.rnn_w[:, 512:]
-        inp = torch.cat([hid.view(B, 7, -1), f_rnn[:, None].expand(B, 7, -1)], -1).transpose(0, 1).reshape(7 * B, -1)
-        ctx = torch.addmm(self.rnn_b, inp, Wc.t(), out_dtype = torch.float32).view(7, B, -1)
+        inp = torch.cat([hid.view(B, K, -1), f_rnn[:, None].expand(B, K, -1)], -1).transpose(0, 1).reshape(K * B, -1)
+        ctx = torch.addmm(self.rnn_b, inp, Wc.t(), out_dtype = torch.float32).view(K, B, -1)
         Wr = self.rnn_w[:, :512]
         state = torch.zeros((B, 256), dtype = torch.bfloat16, device = hid.device)
         prev = anchor_tok
-        base = base.view(B, 7, -1)
+        base = base.view(B, K, -1)
         out = []
+        if self.markov_fused:
+            from .inkling2_markov import MarkovStep
+            ms = self._mstep.get(B)
+            if ms is None:
+                ms = self._mstep[B] = MarkovStep(self, B)
+            for i in range(K):
+                state, prev = ms(state, prev, ctx[i], base[:, i])
+                out.append(prev)
+            return torch.stack(out, 1)
         r = lambda t: t.bfloat16().float()
-        for i in range(7):
+        for i in range(K):
             inputs = torch.cat([state, self.w1[prev]], -1)
             raw = torch.addmm(ctx[i], inputs, Wr.t(), out_dtype = torch.float32)
             gate_raw, cand_raw, out_raw = r(raw).chunk(3, -1)

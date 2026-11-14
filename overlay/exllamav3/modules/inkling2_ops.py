@@ -438,6 +438,7 @@ def _attn_kernel(
     G: tl.constexpr, GP: tl.constexpr, DH: tl.constexpr, HKL: tl.constexpr, BN: tl.constexpr, NSPLIT: tl.constexpr,
     IS_GLOBAL: tl.constexpr, BITS: tl.constexpr, RING: tl.constexpr, PS: tl.constexpr, WINDOW: tl.constexpr,
     EXTENT: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False,
+    relq_ptr = None, relp_ptr = None, REL_FUSED: tl.constexpr = False,
 ):
     t = tl.program_id(0)
     hk = tl.program_id(1)
@@ -468,6 +469,10 @@ def _attn_kernel(
         l_i = tl.zeros([GP], dtype = tl.float32)
     acc = tl.zeros([GP, DH], dtype = tl.float32)
     R_row = R_ptr + (t * HL + hq) * EXTENT
+    if REL_FUSED:
+        # relative-logit bias computed in-kernel: bias[g, j] = rel_q[t, g, :] . rel_proj[:, pos - j] (fp32, IEEE dot)
+        offs_c = tl.arange(0, 16)
+        rq = tl.load(relq_ptr + (t * HL + hq[:, None]) * 16 + offs_c[None, :], mask = gm[:, None], other = 0.0).to(tl.float32)
     for b in range(b0, b1):
         j = lo + b * BN + tl.arange(0, BN)
         valid = j <= pos
@@ -479,7 +484,12 @@ def _attn_kernel(
         k = _load_kv_tile(kq_ptr, ks_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, valid, offs_d, BITS, DH, NG, Q16)
         s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
         d = pos - j
-        bias = tl.load(R_row[:, None] + d[None, :], mask = gm[:, None] & (valid & (d < EXTENT))[None, :], other = 0.0)
+        if REL_FUSED:
+            md = valid & (d < EXTENT)
+            pr = tl.load(relp_ptr + offs_c[:, None] * EXTENT + d[None, :], mask = md[None, :], other = 0.0)
+            bias = tl.dot(rq, pr, input_precision = "ieee")
+        else:
+            bias = tl.load(R_row[:, None] + d[None, :], mask = gm[:, None] & (valid & (d < EXTENT))[None, :], other = 0.0)
         s = s + bias
         s = tl.where(valid[None, :], s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -521,18 +531,21 @@ def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t,
 
 
 def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, o_out, cfg, is_global, bits, ring_size, ps,
-              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False):
+              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False, rel = None):
+    """rel: optional (rel_q [T, Hl, 16] bf16, rel_proj [16, EXTENT] fp32) -> relative bias computed in-kernel (R unused)"""
     """q: [T, Hl, 128] bf16, R: [T, Hl, 1024] fp32, sink: [T, Hl] view, gate: [T, Hl*128] view. Writes o_out [T, Hl*128] bf16"""
     T = q.shape[0]
     pm, pl, po = scratch
     HL = g * hkl
     _attn_kernel[(T, hkl, nsplit)](
-        q, R, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq,
+        q, R if R is not None else q, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq,
         page_table if page_table is not None else slot, page_table.stride(0) if page_table is not None else 0, slot, pos,
         pm, pl, po,
         sink.stride(0), kq.stride(-3), kq.stride(-2), (_sc_stride_pos(ks, ng) if ks is not None else 0), 128 ** -0.5,
         G = g, GP = 16, DH = 128, HKL = hkl, BN = bn, NSPLIT = nsplit, IS_GLOBAL = is_global, BITS = bits,
-        RING = ring_size, PS = ps, WINDOW = cfg.window, EXTENT = cfg.rel_extent, NG = ng, Q16 = q16, num_warps = 4,
+        RING = ring_size, PS = ps, WINDOW = cfg.window, EXTENT = cfg.rel_extent, NG = ng, Q16 = q16,
+        relq_ptr = rel[0] if rel is not None else q, relp_ptr = rel[1] if rel is not None else q, REL_FUSED = rel is not None,
+        num_warps = 4,
     )
     _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = nsplit,
                                   rot_ptr = rot if rot is not None else gate, ROT = rot is not None)
