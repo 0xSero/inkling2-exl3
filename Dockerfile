@@ -7,7 +7,7 @@ ENV VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH
 RUN uv venv /opt/venv --python 3.10 --seed
 RUN uv pip install --no-cache torch==2.8.0 --index-url https://download.pytorch.org/whl/cu128
 RUN uv pip install --no-cache "huggingface_hub[cli]" hf_transfer tokenizers numpy rich typing_extensions safetensors ninja pillow pyyaml \
-    marisa_trie pydantic "llguidance>=1.7.0" setuptools wheel
+    marisa_trie pydantic "llguidance>=1.7.0" setuptools wheel fastapi uvicorn jinja2
 
 # Pinned upstream exllamav3 (turboderp-org, MIT) + Inkling-2 overlay
 ARG EXLLAMAV3_REF=v1.6.6
@@ -22,8 +22,10 @@ ENV TORCH_CUDA_ARCH_LIST="12.0" MAX_JOBS=8
 RUN cd /opt/exllamav3 && uv pip install --no-cache --no-build-isolation .
 
 COPY bench /opt/inkling2/bench
+COPY server /opt/inkling2/server
 COPY scripts /opt/inkling2/scripts
-ENV MODEL_DIR=/models/Inkling-2-Small-EXL3-3.48bpw RESULTS_DIR=/models/results SPEC=on HF_HUB_ENABLE_HF_TRANSFER=1
+ENV MODEL_DIR=/models/Inkling-2-Small-EXL3-4bpw RESULTS_DIR=/models/results I2_MOE_GROUP=64 NCCL_CUMEM_ENABLE=0 HF_HUB_ENABLE_HF_TRANSFER=1
+EXPOSE 8000
 WORKDIR /opt/inkling2
 ENTRYPOINT ["/opt/inkling2/scripts/entrypoint.sh"]
 CMD ["sweep"]

@@ -34,10 +34,10 @@ def rope_neox(x, pos, theta = 1e6):
 
 
 @triton.jit
-def _dattn_kernel(q_ptr, kc_ptr, vc_ptr, page_table_ptr, pt_stride, slot_ptr, pa_ptr, pm_ptr, pl_ptr, po_ptr,
+def _dattn_kernel(q_ptr, kc_ptr, vc_ptr, ks_ptr, vs_ptr, page_table_ptr, pt_stride, slot_ptr, pa_ptr, pm_ptr, pl_ptr, po_ptr,
                   G: tl.constexpr, HKL: tl.constexpr, DH: tl.constexpr, BN: tl.constexpr, NSPLIT: tl.constexpr,
                   IS_GLOBAL: tl.constexpr, RING: tl.constexpr, PS: tl.constexpr, WINDOW: tl.constexpr, BLK: tl.constexpr,
-                  ROWS: tl.constexpr):
+                  ROWS: tl.constexpr, Q8: tl.constexpr):
     b = tl.program_id(0)
     hk = tl.program_id(1)
     sp = tl.program_id(2)
@@ -73,6 +73,9 @@ def _dattn_kernel(q_ptr, kc_ptr, vc_ptr, page_table_ptr, pt_stride, slot_ptr, pa
         else:
             rows = slot.to(tl.int64) * RING + j % RING
         k = tl.load(kc_ptr + (rows * HKL + hk)[:, None] * DH + offs_d[None, :], mask = valid[:, None], other = 0.0)
+        if Q8:
+            ksc = tl.load(ks_ptr + rows * HKL + hk, mask = valid, other = 0.0).to(tl.float32)
+            k = (k.to(tl.float32) * ksc[:, None]).to(tl.bfloat16)
         s = tl.dot(q, tl.trans(k)) * 0.08838834764831845
         s = tl.where(valid[None, :], s, -float("inf"))
         m_new = tl.maximum(m_i, tl.max(s, 1))
@@ -80,6 +83,9 @@ def _dattn_kernel(q_ptr, kc_ptr, vc_ptr, page_table_ptr, pt_stride, slot_ptr, pa
         p = tl.exp(s - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
         v = tl.load(vc_ptr + (rows * HKL + hk)[:, None] * DH + offs_d[None, :], mask = valid[:, None], other = 0.0)
+        if Q8:
+            vsc = tl.load(vs_ptr + rows * HKL + hk, mask = valid, other = 0.0).to(tl.float32)
+            v = (v.to(tl.float32) * vsc[:, None]).to(tl.bfloat16)
         acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
         m_i = m_new
     base = ((b * BLK + qi) * HL + hq) * NSPLIT + sp
@@ -147,10 +153,40 @@ class I2Draft:
             self.fold_w[s:s + 4096] = (hd @ ho_w.double()).bfloat16()
             self.fold_b[s:s + 4096] = (hd @ ho_b.double()).bfloat16()
         # draft KV caches (bf16): local layers ring per slot, global layer paged (shares the target's page table)
-        self.kv = []
+        # global layer (2): int8 codes + fp16 per-(token, head) scale, as the target's 8-bit KV
+        self.kv = [None] * 5; self.kvs = [None] * 5
+        self.alloc(num_pages)
+
+    def alloc(self, num_pages):
+        dev = self.dev
         for i in range(5):
-            shape = (max_slots, RINGD, self.Hkl, 128) if i in self.LOCAL else (num_pages, page_size, self.Hkl, 128)
-            self.kv.append((torch.zeros(shape, dtype = torch.bfloat16, device = device), torch.zeros(shape, dtype = torch.bfloat16, device = device)))
+            if i in self.LOCAL:
+                if self.kv[i] is None:
+                    shape = (self.max_slots, RINGD, self.Hkl, 128)
+                    self.kv[i] = (torch.zeros(shape, dtype = torch.bfloat16, device = dev), torch.zeros(shape, dtype = torch.bfloat16, device = dev))
+            else:
+                shape = (num_pages, self.ps, self.Hkl, 128)
+                self.kv[i] = (torch.zeros(shape, dtype = torch.int8, device = dev), torch.zeros(shape, dtype = torch.int8, device = dev))
+                self.kvs[i] = (torch.zeros(shape[:-1], dtype = torch.half, device = dev), torch.zeros(shape[:-1], dtype = torch.half, device = dev))
+
+    @staticmethod
+    def global_bytes_per_token(hkl):
+        return 2 * hkl * (128 + 2)
+
+    def _write(self, i, rows, k, v):
+        """k, v: [R, Hkl, 128] bf16 -> cache rows"""
+        kc, vc = self.kv[i]
+        if i in self.LOCAL:
+            kc.view(-1, self.Hkl, 128)[rows] = k
+            vc.view(-1, self.Hkl, 128)[rows] = v
+            return
+        ks, vs = self.kvs[i]
+        for src, dst, sdst in ((k, kc, ks), (v, vc, vs)):
+            f = src.float()
+            sc = (f.abs().amax(-1) / 127.0).clamp_min(1e-8)
+            q = torch.round(f / sc[..., None]).clamp_(-128, 127).to(torch.int8)
+            dst.view(-1, self.Hkl, 128)[rows] = q
+            sdst.view(-1, self.Hkl)[rows] = sc.half()
 
     # ---- helpers
     def mix(self, feats, row, w):
@@ -181,22 +217,21 @@ class I2Draft:
             k = rms(k.reshape(-1, 128), L["knc"]).view(R, self.Hkl, 128)
             k = rope_neox(k, pos)
             rows = self._cache_rows(i, slot, pos)
-            kc, vc = self.kv[i]
-            kc.view(-1, self.Hkl, 128)[rows] = k
-            vc.view(-1, self.Hkl, 128)[rows] = v.reshape(R, self.Hkl, 128)
+            self._write(i, rows, k, v.reshape(R, self.Hkl, 128))
 
     def attention(self, i, q, slot, pa, nsplit):
         B = slot.shape[0]
         HL = self.Hl
         kc, vc = self.kv[i]
+        ks, vs = self.kvs[i] if self.kvs[i] is not None else (kc, vc)
         pm = torch.empty((B * BLOCK * HL, nsplit), dtype = torch.float32, device = q.device)
         pl = torch.empty_like(pm)
         po = torch.empty((B * BLOCK * HL, nsplit, 128), dtype = torch.float32, device = q.device)
         o = torch.empty((B * BLOCK, HL * 128), dtype = torch.bfloat16, device = q.device)
         _dattn_kernel[(B, self.Hkl, nsplit)](
-            q, kc, vc, self.eng.page_table, self.eng.page_table.stride(0), slot, pa, pm, pl, po,
+            q, kc, vc, ks, vs, self.eng.page_table, self.eng.page_table.stride(0), slot, pa, pm, pl, po,
             G = self.G, HKL = self.Hkl, DH = 128, BN = 64, NSPLIT = nsplit, IS_GLOBAL = i not in self.LOCAL,
-            RING = RINGD, PS = self.ps, WINDOW = 1024, BLK = BLOCK, ROWS = 64, num_warps = 4)
+            RING = RINGD, PS = self.ps, WINDOW = 1024, BLK = BLOCK, ROWS = 64, Q8 = i not in self.LOCAL, num_warps = 4)
         _dattn_combine[(B * BLOCK * HL,)](pm, pl, po, o, DH = 128, NSPLIT = nsplit)
         return o
 
@@ -220,9 +255,7 @@ class I2Draft:
             q = rope_neox(rms(q, L["qn"]).view(-1, self.Hl, 128), pos).reshape(B * BLOCK, self.Hl * 128)
             k = rope_neox(rms(k, L["kn"]).view(-1, self.Hkl, 128), pos)
             rows = self._cache_rows(i, slot_r, pos)
-            kc, vc = self.kv[i]
-            kc.view(-1, self.Hkl, 128)[rows] = k
-            vc.view(-1, self.Hkl, 128)[rows] = v.reshape(-1, self.Hkl, 128)
+            self._write(i, rows, k, v.reshape(-1, self.Hkl, 128))
             o = self.attention(i, q, slot, pa, nsplit_l if i in self.LOCAL else nsplit_g)
             o = torch.mm(o, L["wo"].t())
             eng.allreduce(o)

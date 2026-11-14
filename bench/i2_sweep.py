@@ -7,14 +7,12 @@ from exllamav3.modules.inkling2_engine import I2Engine, Batch
 from exllamav3.modules.inkling2_draft import I2Draft
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-3.48bpw"))
+ap.add_argument("--model-dir", default=os.environ.get("MODEL_DIR", "/models/Inkling-2-Small-EXL3-4bpw"))
 ap.add_argument("--concurrency", default=os.environ.get("CONCURRENCY", "1,4,8,16"))
 ap.add_argument("--repeats", type=int, default=int(os.environ.get("REPEATS", "3")))
 ap.add_argument("--steps", type=int, default=int(os.environ.get("STEPS", "128")), help="tokens generated per sequence")
 ap.add_argument("--prompt", type=int, default=int(os.environ.get("PROMPT", "256")))
 ap.add_argument("--graph", type=int, default=int(os.environ.get("GRAPH", "1")))
-ap.add_argument("--spec", default=os.environ.get("SPEC", "on"), choices=["on", "off"],
-                help="speculative decoding (MTP) on/off; default on")
 ap.add_argument("--prompt-file", default=os.environ.get("PROMPT_FILE", "/opt/exllamav3/README.md"), help="public text used for prompts")
 ap.add_argument("--layers", type=int, default=48)
 ap.add_argument("--out", default=os.environ.get("RESULTS_DIR", "/models/results"))
@@ -27,7 +25,7 @@ def log(*x):
     if rank == 0: print(time.strftime("%H:%M:%S"), *x, flush=True)
 
 
-spec_on = a.spec == "on"
+spec_on = True   # speculative decoding is always on; there is no plain-decode mode
 cfg = Config.from_directory(a.model_dir)
 model = Model.from_config(cfg, tp_rank=rank, tp_size=world)
 model.layers = model.layers[:a.layers]
@@ -80,31 +78,6 @@ def do_prefill(B):
     torch.cuda.synchronize(); return res, time.time() - t0
 
 @torch.no_grad()
-def decode_plain(B, N, first):
-    tok = torch.cat([f[0] for f in first])
-    slot = torch.arange(B, dtype=torch.int32, device=dev)
-    pos = torch.full((B,), a.prompt, dtype=torch.int32, device=dev)
-    bt = Batch(slot, pos, torch.zeros(B, dtype=torch.int32, device=dev), False, nsplit_g=4, nsplit_l=4)
-    sid = tok.clone()
-    def one(): return eng.global_argmax(eng.forward(sid, bt))
-    graph = None
-    if a.graph:
-        st = torch.cuda.Stream(); st.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(st):
-            for _ in range(3): one()
-        torch.cuda.current_stream().wait_stream(st); torch.cuda.synchronize(); dist.barrier()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph): sout = one()
-    out = tok
-    torch.cuda.synchronize(); dist.barrier(); t0 = time.time()
-    for _ in range(N - 1):
-        sid.copy_(out)
-        out = (graph.replay() or sout.clone()) if graph else one()
-        pos += 1
-    torch.cuda.synchronize(); dt = time.time() - t0
-    return dict(steps=N - 1, tokens=B * (N - 1), dt=dt, accept=None)
-
-@torch.no_grad()
 def decode_spec(B, N, first):
     slot = torch.arange(B, dtype=torch.int32, device=dev)
     anchor = torch.cat([f[0] for f in first]); feats_last = torch.cat([f[1] for f in first])
@@ -155,7 +128,7 @@ for B in Bs:
     runs = []
     for r in range(a.repeats + 1):               # first run is warmup (kernel autotune), discarded
         first, tp = do_prefill(B)
-        d_ = (decode_spec if spec_on else decode_plain)(B, a.steps, first)
+        d_ = decode_spec(B, a.steps, first)
         d_["prefill_tok_s"] = B * a.prompt / tp
         d_["decode_tok_s"] = d_["tokens"] / d_["dt"]; d_["steps_s"] = d_["steps"] / d_["dt"]
         if r > 0: runs.append(d_)
@@ -170,8 +143,8 @@ for B in Bs:
 if rank == 0:
     meta = dict(date=time.strftime("%Y-%m-%d %H:%M:%S"), model_dir_name=os.path.basename(a.model_dir.rstrip("/")),
                 prompt=a.prompt, tokens_per_seq=a.steps, repeats=a.repeats, cuda_graphs=bool(a.graph),
-                spec=a.spec, gpus=[torch.cuda.get_device_name(i) for i in range(world)])
-    lab = "speculative decoding ON (DSpark/MTP)" if spec_on else "SPEC OFF (plain decode)"
+                spec="on", gpus=[torch.cuda.get_device_name(i) for i in range(world)])
+    lab = "speculative decoding (DSpark/MTP)"
     lines = [f"### Inkling-2-Small EXL3 sweep - {lab}", "",
              f"{a.prompt}-token prompts, {a.steps} generated tokens/seq, median of {a.repeats} repeats, CUDA graphs={'on' if a.graph else 'off'}", "",
              "| concurrency | decode tok/s | accept len | steps/s | prefill tok/s |", "|---|---|---|---|---|"]
@@ -181,7 +154,7 @@ if rank == 0:
     print("\n" + "\n".join(lines) + "\n", flush=True)
     try:
         os.makedirs(a.out, exist_ok=True)
-        fn = os.path.join(a.out, "sweep-" + time.strftime("%Y%m%d-%H%M%S") + f"-spec{a.spec}.json")
+        fn = os.path.join(a.out, "sweep-" + time.strftime("%Y%m%d-%H%M%S") + "-spec.json")
         json.dump(dict(meta=meta, results=results), open(fn, "w"), indent=2)
         print("wrote", fn)
     except OSError as e:

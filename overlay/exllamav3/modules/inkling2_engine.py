@@ -68,6 +68,7 @@ class I2Engine:
         self.page_table = torch.zeros((max_slots, max_pages_per_seq), dtype = torch.int32, device = dev)
         self.group = None
         self.moe_chunk_max = int(__import__('os').environ.get('I2_MOE_CHUNK_MAX', 192))
+        self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
 
     # ---- memory accounting
     def kv_bytes(self):
@@ -186,9 +187,10 @@ class I2Engine:
         xm = ops.attn_res_norm(blocks, nb_m, resid, L.mlp_query[None], L.mlp_norm, c.eps, out_f16 = True)[0]
 
         # routed experts (expert parallel), summed over ranks
-        if 8 < T <= self.moe_chunk_max:
-            # the fused bsz<=8 decode kernels beat the wide tiers by 3-6x per token: run groups of 8 rows
-            moe = torch.cat([L.mlp.forward(xm[s:s + 8], {}).view(-1, c.hidden).clone() for s in range(0, T, 8)], 0)
+        G = self.moe_group
+        if G < T <= self.moe_chunk_max:
+            # the fused coop kernels take up to MAX_BSZN (64) rows per call: groups of `moe_group` rows
+            moe = torch.cat([L.mlp.forward(xm[s:s + G], {}).view(-1, c.hidden).clone() for s in range(0, T, G)], 0)
         else:
             moe = L.mlp.forward(xm, {})
         moe = moe.view(T, c.hidden)
@@ -205,7 +207,7 @@ class I2Engine:
 
     TAP_LAYERS = (5, 11, 17, 23, 29, 35, 41)
 
-    def forward(self, ids, B: Batch, stop_layer = None, taps = None):
+    def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False):
         """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world].
         taps: optional [T, 8, D] bf16 buffer receiving the draft's target features (inputs of layers 5..41, final-norm output)"""
         h = self.embed_tokens(ids)
@@ -219,6 +221,8 @@ class I2Engine:
         x = self.head_hidden(h, blocks)
         if taps is not None:
             taps[:, 7].copy_(x)
+        if return_hidden:
+            return x
         z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
         return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
 
