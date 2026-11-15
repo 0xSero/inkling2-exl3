@@ -42,7 +42,7 @@ COPY scripts /opt/inkling2/scripts
 # EXL3_LOAD_ARENA=0 (needed by the b12x repack), I2_MOE_GROUP=64 for prefill-sized coop MoE calls. KV format, 380K context,
 # 16 slots, per-bucket draft length (--spec-k) and the fused/skinny kernels are the code's own defaults.
 ENV MODEL_DIR=/models/Inkling-2-Small-EXL3-4bpw RESULTS_DIR=/models/results I2_MOE_GROUP=64 NCCL_CUMEM_ENABLE=0 \
-    I2_B12X=1 I2_EP_LAYOUT=ep2tp2 I2_DRAFT_FP8=1 I2_B12X_PATH=/opt/flashinfer EXL3_LOAD_ARENA=0 \
+    I2_B12X=1 I2_EP_LAYOUT=ep2tp2 I2_DRAFT_FP8=1 I2_PC_SHARD=1 I2_B12X_PATH=/opt/flashinfer EXL3_LOAD_ARENA=0 \
     PYTHONPATH=/opt/flashinfer:/opt/flashinfer/flashinfer/experimental/b12x/_compat
 EXPOSE 8000
 WORKDIR /opt/inkling2

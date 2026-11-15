@@ -18,3 +18,9 @@
   specific language governing permissions and limitations under the License.
 - NVIDIA CUTLASS DSL (`nvidia-cutlass-dsl`), installed from PyPI under NVIDIA's license; it compiles the b12x kernels.
 - Inkling-2-Small model by Thinking Machines, Apache-2.0. The EXL3 quant weights are a derivative under the same license.
+- NVIDIA Hyperflare (https://github.com/NVIDIA/hyperflare-inference, branch `testing/inkling2`), Apache License 2.0.
+  The token-sharded prefill in `overlay/exllamav3/modules/inkling2_engine.py` (`forward_sharded`, `_layer_sh`) follows the
+  layer structure of its Inkling-2 decoder (`recipes/inkling2/decoder.py`: owner rows for norms / router / residuals,
+  all-gather before attention and experts, reduce-scatter after), adapted to EP2xTP2 experts and to output
+  convolutions on reduced rows. The copy-engine ring in `inkling2_pc.py` / `inkling2_pc_src.py` is new code after the
+  idea of b12x's `comm/pcie/pcie_dma.py`.

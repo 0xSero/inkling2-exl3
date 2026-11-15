@@ -9,6 +9,7 @@ Sampling: temperature (Gumbel-max, speculative sampling with deterministic draft
 """
 import os, sys, time, json, math, threading, queue, argparse, asyncio, uuid
 import torch, torch.distributed as dist
+os.environ.setdefault("I2_DRAFT_RINGD", "2112")      # draft local ring: window 1024 + previous generation (session reuse)
 from exllamav3.model.config import Config
 from exllamav3.model.model import Model
 from exllamav3.modules.inkling2_engine import I2Engine, Batch
@@ -20,7 +21,7 @@ ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--host", default="0.0.0.0")
 ap.add_argument("--slots", type=int, default=16)
 ap.add_argument("--kv-gb", type=float, default=0.0, help="KV cache budget per GPU for global-layer pages (0 = auto from free memory)")
-ap.add_argument("--reserve-gb", type=float, default=2.0, help="free memory kept for workspace when sizing KV automatically (measured peak extra use: 0.6 GiB)")
+ap.add_argument("--reserve-gb", type=float, default=1.75, help="free memory kept for workspace when sizing KV automatically (4096-row sharded prefill keeps ~2.5 GiB headroom unused at 1.75; 16x380K needs <= 1.9)")
 ap.add_argument("--max-model-len", type=int, default=380000)
 ap.add_argument("--bits-g", type=int, default=4); ap.add_argument("--bits-l", type=int, default=8)
 ap.add_argument("--burst", type=int, default=1, help="max back-to-back speculative steps per scheduler round (1 = one host sync per step)")
@@ -28,8 +29,17 @@ ap.add_argument("--spec-k", default="1:4,2:3,4:2,8:2,16:2", help="draft length p
 ap.add_argument("--kv-rot", type=int, default=1, help="global KV: randomized Hadamard rotation along head_dim before quantizing")
 ap.add_argument("--kv-ng", type=int, default=4, help="global KV: fp16 scale groups per 128-vector (1, 2, 4)")
 ap.add_argument("--kv-q16", type=int, default=1, help="global 4-bit KV: 16-level symmetric grid")
-ap.add_argument("--chunk", type=int, default=512)
-ap.add_argument("--served-name", default="inkling-2-small-exl3-v3")
+ap.add_argument("--swa-rows", type=int, default=1024, help="SWA ring headroom (window + this); longer multi-row calls run their SWA layers in sub-chunks of this many rows")
+ap.add_argument("--nsplit-g", type=int, default=32, help="KV splits of the global-layer attention in decode graphs (target verify + draft); long contexts need many (8 gave 11 tok/s at 128K)")
+ap.add_argument("--sse-batch", type=int, default=1, help="one stream event / SSE chunk per request per scheduler step (instead of per token)")
+ap.add_argument("--chunk", type=int, default=4096, help="prefill chunk rows of a pure prefill step (b12x T=1024 with 32-row route blocks: 2.33 us/token/layer vs 3.59 at 512)")
+ap.add_argument("--mixed", type=int, default=1, help="chunked prefill rides in the decode step: one forward carries every active slot's verify rows plus prefill chunks of pending prompts (eager); pure decode steps keep the graphs")
+ap.add_argument("--prefill-budget", type=int, default=512, help="prefill tokens per mixed step while requests are decoding (TTFT vs inter-token latency), capped by --max-step-rows; the full --chunk when none are")
+ap.add_argument("--state-slots", type=int, default=24, help="sequence state slots (rings + pages); beyond --slots they hold parked sessions for reuse")
+ap.add_argument("--reuse", type=int, default=0, help="session reuse: a new request extending a parked session's history takes its slot over and prefills only the rest (needs --mixed 1)")
+ap.add_argument("--reuse-min", type=int, default=1024, help="minimum reused prefix (tokens)")
+ap.add_argument("--max-step-rows", type=int, default=512, help="rows per mixed (decode + prefill) forward: keeps the decoding users' step near a 512-row chunk")
+ap.add_argument("--served-name", default="inkling-2-small")
 ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "0")), help="routed experts of the speculative verify through the b12x fused Trellis MoE (needs the b12x stack: cutlass-dsl + FlashInfer tree at I2_B12X_PATH)")
 args = ap.parse_args()
 if args.b12x:
@@ -58,6 +68,8 @@ model.embed.load(dev)
 for L in model.layers: L.load(dev)
 model.head.load(dev)
 S = args.slots
+REUSE = bool(args.reuse and args.mixed)
+NS = max(S, args.state_slots) if REUSE else S          # state slots (decode concurrency stays S)
 PS = 64
 free0, total = torch.cuda.mem_get_info()
 log(f"weights loaded in {time.time()-t0:.0f}s; GPU free {free0/2**30:.1f} GiB")
@@ -70,10 +82,12 @@ def page_bytes():
 fixed = (S + 1) * (40 * 2 * (1024 + 64) * HKL * ((64 if args.bits_l == 4 else 128) + 2) + 48 * 2 * 4096 * 16 * 2 // 1) * 0  # accounted by free-memory probe below
 pt_len = args.max_model_len // PS + 2
 # measure the fixed per-slot state by constructing the engine with a tiny page pool first
-eng = I2Engine(model, dev, rank, world, max_slots=S + 1, num_pages=8, page_size=PS, bits_g=args.bits_g, bits_l=args.bits_l,
+eng = I2Engine(model, dev, rank, world, max_slots=NS + 1, num_pages=8, page_size=PS, bits_g=args.bits_g, bits_l=args.bits_l,
                max_pages_per_seq=pt_len, kv_rot=bool(args.kv_rot), kv_ng=args.kv_ng, kv_q16=bool(args.kv_q16),
-               max_rows=args.chunk)
-draft = I2Draft(args.model + "/mtp.safetensors", eng, dev, rank, world, S + 1, 8, PS) if SPEC else None
+               max_rows=args.swa_rows)
+draft = I2Draft(args.model + "/mtp.safetensors", eng, dev, rank, world, NS + 1, 8, PS) if SPEC else None
+# conv-ring snapshots at prompt end (session reuse restore point (b)): same shapes as the engine's per-slot conv rings
+SNAP = {i: tuple(torch.zeros_like(r) for r in rs) for i, rs in eng.rings.items()} if REUSE else None
 if args.b12x:
     from exllamav3.modules.inkling2_b12x import B12xMoE
     tb = time.time()
@@ -99,14 +113,14 @@ log(f"KV pages: {NP} x {PS} = {NP*PS:,} tokens (per GPU {NP*page_bytes()/2**30:.
 
 # ---------------------------------------------------------------------------------------------------------- state
 BUCKETS = [b for b in (1, 2, 4, 8, 16) if b <= S]
-DUMMY = S                               # scratch slot for padded rows; owns page 0
+DUMMY = NS                              # scratch slot for padded rows; owns page 0
 PROF_AT = int(os.environ.get("I2_PROFILE_AT", "0")); PROF_STEP = 0
 BURST_EMIT = torch.zeros((max(1, args.burst), S + 1, 8), dtype=torch.long, device=dev)
 BURST_N = torch.zeros((max(1, args.burst), S + 1), dtype=torch.long, device=dev)
-anchor_all = torch.zeros(S + 1, dtype=torch.long, device=dev)
-d_all = torch.zeros((S + 1, 7), dtype=torch.long, device=dev)
-P_all = torch.zeros(S + 1, dtype=torch.int32, device=dev)
-temp_all = torch.zeros(S + 1, dtype=torch.float32, device=dev)
+anchor_all = torch.zeros(NS + 1, dtype=torch.long, device=dev)
+d_all = torch.zeros((NS + 1, 7), dtype=torch.long, device=dev)
+P_all = torch.zeros(NS + 1, dtype=torch.int32, device=dev)
+temp_all = torch.zeros(NS + 1, dtype=torch.float32, device=dev)
 eng.page_table[DUMMY, :2] = 0
 EOS = 200006
 V = cfg.i2.unpadded_vocab
@@ -145,7 +159,7 @@ class Bucket:
         anchor = anchor_all[sl]
         temps = temp_all[sl].repeat_interleave(R)
         pos = (P[:, None] + arR[None]).reshape(-1).to(torch.int32)
-        nsplit_g = 8
+        nsplit_g = args.nsplit_g
         if self.spec:
             d = d_all[sl][:, :K]
             ids = torch.cat([anchor[:, None], d], 1).reshape(-1)
@@ -194,7 +208,7 @@ with torch.no_grad():
 log(f"speculative graphs captured for buckets {BUCKETS} (draft K {[spec_k(b) for b in BUCKETS]}) in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
 
 # ---------------------------------------------------------------------------------------------------------- commands
-OP_NOOP, OP_PREFILL, OP_DECODE, OP_STOP = 0, 1, 2, 9
+OP_NOOP, OP_PREFILL, OP_DECODE, OP_PAGES, OP_MIXED, OP_SNAP, OP_RESTORE, OP_STOP = 0, 1, 2, 3, 4, 5, 6, 9
 HDR = torch.zeros(8, dtype=torch.long, device=dev)
 PAY = torch.zeros(args.max_model_len // PS + 4096 + 64, dtype=torch.long, device=dev)
 FPAY = torch.zeros(64, dtype=torch.float32, device=dev)
@@ -270,6 +284,88 @@ def do_decode(h, pay, fpay):
         return BURST_EMIT[:nsteps, :B, :R].cpu(), BURST_N[:nsteps, :B].cpu()
     return None
 
+@torch.no_grad()
+def do_pages(h, pay, fpay):
+    """page table of a newly admitted request (sent once at admission)"""
+    slot, npg = h[1], h[2]
+    eng.page_table[slot, :npg] = pay[:npg].to(torch.int32)
+
+@torch.no_grad()
+def do_snap(h, pay, fpay):
+    """conv rings of slot h[1] -> snapshot (at prompt end); h[2] = 1 restores the snapshot instead"""
+    slot = h[1]
+    for i, rs in eng.rings.items():
+        for r, sn in zip(rs, SNAP[i]):
+            (r[slot] if h[2] else sn[slot]).copy_(sn[slot] if h[2] else r[slot])
+
+@torch.no_grad()
+def do_mixed(h, pay, fpay):
+    """one eager forward over every active slot's verify rows (speculative step as Bucket.step) plus prefill chunks.
+    h = [OP_MIXED, nact, nseg, ntok, ...]; pay = decode slots (nact) + nseg x (slot, start, n, last) + chunk token ids;
+    fpay = per-segment temperature. Rank 0 returns (emit [nact, R], n [nact], {slot: first token})"""
+    nact, nseg, ntok = h[1], h[2], h[3]
+    p = pay[:nact + 4 * nseg].tolist()
+    dslots = p[:nact]
+    segs = [p[nact + 4 * i: nact + 4 * i + 4] for i in range(nseg)]
+    ids_p = pay[nact + 4 * nseg: nact + 4 * nseg + ntok]
+    i32 = lambda t: t.to(torch.int32)
+    parts = []                                     # (ids, slot, pos, nprev, nafter) per block of rows
+    if nact:
+        K = spec_k(next(b for b in BUCKETS if b >= nact)); R = K + 1; arR = ar8[:R]
+        sl = torch.tensor(dslots, dtype=torch.int32, device=dev); sll = sl.long()
+        P = P_all[sll]; d = d_all[sll][:, :K]
+        nprev = arR.repeat(nact)
+        parts.append((torch.cat([anchor_all[sll][:, None], d], 1).reshape(-1), sl.repeat_interleave(R),
+                      i32((P[:, None] + arR[None]).reshape(-1)), nprev, i32(K - nprev)))
+    off = 0
+    for slot, start, n, last in segs:
+        ar = torch.arange(n, dtype=torch.int32, device=dev)
+        parts.append((ids_p[off:off + n], torch.full((n,), slot, dtype=torch.int32, device=dev), i32(ar + start), ar, i32(n - 1 - ar)))
+        off += n
+    ids, slot_r, pos_r, nprev_r, nafter_r = (torch.cat([q[j] for q in parts]) for j in range(5))
+    T = ids.shape[0]
+    # one prompt chunk and no decode rows: a single-sequence batch, so the engine can run it token-sharded (I2_PC_SHARD)
+    bt = Batch(slot_r, pos_r, nprev_r, True, nsplit_g=8, nsplit_l=4, nafter=None if (nact == 0 and nseg == 1) else nafter_r)
+    taps = torch.empty((T, 8, 4608), dtype=torch.bfloat16, device=dev)
+    # logits only for the rows that are sampled: every decode row, and the last row of each finishing prompt
+    lr, r_ = list(range(nact * R)) if nact else [], (nact * R if nact else 0)
+    last_rows = {}
+    for slot, start, n, last in segs:
+        r_ += n
+        if last: last_rows[slot] = len(lr); lr.append(r_ - 1)
+    z = eng.forward(ids, bt, taps=taps, logit_rows=torch.tensor(lr, dtype=torch.long, device=dev)) if lr else None
+    if z is None:
+        eng.forward(ids, bt, taps=taps, return_hidden=True)
+    if nact:
+        g = sample_rows(z[:nact * R], temp_all[sll].repeat_interleave(R)).view(nact, R)
+        nacc = (d == g[:, :K]).int().cumprod(1).sum(1)
+    draft.store_context(taps, slot_r, pos_r)
+    emit_n = None
+    if nact:
+        newanchor = g.gather(1, nacc[:, None])[:, 0]
+        emit = torch.cat([d, g[:, :1]], 1)
+        emit.scatter_(1, nacc[:, None], newanchor[:, None])
+        Pn = P + (nacc + 1).to(torch.int32)
+        f_last = taps[:nact * R].view(nact, R, 8, 4608)[torch.arange(nact, device=dev), nacc]
+        dn = draft.draft(newanchor, sl, Pn, f_last, nsplit_g=8, K=K)
+        anchor_all[sll] = newanchor; P_all[sll] = Pn; d_all[sll, :K] = dn
+        emit_n = (emit, nacc)
+    first = {}
+    row = nact * R if nact else 0
+    for i, (slot, start, n, last) in enumerate(segs):
+        row += n
+        if last:
+            temp_all[slot] = fpay[i]
+            zi = last_rows[slot]
+            tk = sample_rows(z[zi:zi + 1], temp_all[slot:slot + 1])
+            anchor_all[slot] = tk[0]; P_all[slot] = start + n
+            sl1 = torch.tensor([slot], dtype=torch.int32, device=dev)
+            d_all[slot] = draft.draft(tk, sl1, P_all[slot:slot + 1], taps[row - 1:row], nsplit_g=8)[0]
+            first[slot] = tk
+    if rank == 0:
+        return ((emit_n[0].cpu(), emit_n[1].cpu()) if emit_n else (None, None)), {k: int(v[0]) for k, v in first.items()}
+    return None
+
 def worker_loop():
     while True:
         h, pay, fpay = bcast()
@@ -277,6 +373,9 @@ def worker_loop():
         if op == OP_STOP: break
         if op == OP_PREFILL: do_prefill(h, pay, fpay)
         elif op == OP_DECODE: do_decode(h, pay, fpay)
+        elif op == OP_PAGES: do_pages(h, pay, fpay)
+        elif op == OP_MIXED: do_mixed(h, pay, fpay)
+        elif op in (OP_SNAP, OP_RESTORE): do_snap(h, pay, fpay)
 
 if rank != 0:
     worker_loop()
@@ -301,40 +400,99 @@ template = jenv.from_string(open(args.model + "/chat_template.jinja").read())
 T_MSG_MODEL, T_TEXT, T_THINK, T_END, T_EOS, T_TOOL = 200001, 200004, 200008, 200010, 200006, 200049
 
 pending = queue.Queue()
-free_slots = list(range(S))
+free_slots = list(range(NS))
+import collections, numpy as np
+parked = collections.OrderedDict()  # slot -> parked session (LRU order): hist, P, plen, written, pages, snap
 free_pages = list(range(1, NP))       # page 0 belongs to the dummy slot
 active = {}                           # slot -> Req
 prefilling = []                       # Reqs with remaining prompt
 loop_ref = {}
-STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0}
+STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0, 'stall_time': 0.0, 'tool_ok': 0, 'tool_bad': 0, 'mix_steps': 0, 'mix_time': 0.0, 'mix_pre_tok': 0, 'mix_rows': 0, 'mix_tok': 0, 'mix_dsteps': 0, 'aborted': 0, 'pre_cached_tok': 0, 'reuse_a': 0, 'reuse_b': 0, 'reuse_evict': 0}
 
 class Req:
     def __init__(self, ids, max_tokens, temperature, out_q):
         self.ids, self.max_tokens, self.temperature, self.out_q = ids, max_tokens, temperature, out_q
         self.id = "chatcmpl-" + uuid.uuid4().hex[:24]
         self.slot = None; self.pages = []; self.done_prompt = 0; self.gen = []; self.t_arrive = time.time()
+        self.ignore_eos = False
         self.first_token_time = None; self.finish = None
 
 def emit(req, item):
     loop_ref["loop"].call_soon_threadsafe(req.out_q.put_nowait, item)
 
+admitted = []                         # admitted since the last scheduler round (their page tables go out via OP_PAGES)
+
+def evict_one():
+    """drop the least recently used parked session; False if none"""
+    if not parked: return False
+    slot, rec = parked.popitem(last=False)
+    free_pages.extend(rec["pages"]); free_slots.append(slot); STATS['reuse_evict'] += 1
+    return True
+
+def take_pages(n):
+    while len(free_pages) < n and evict_one(): pass
+    if len(free_pages) < n: return None
+    return [free_pages.pop() for _ in range(n)]
+
+def match_parked(ids):
+    """best exact restore point among parked sessions: (slot, p, mode) or None. (a) continuation of the committed history
+    (p = common prefix, within 8 of the valid KV length); (b) the previous prompt end (conv snapshot; previous generation
+    <= 1000 tokens so the SWA / draft rings still hold the window before it)"""
+    if not parked or len(ids) <= args.reuse_min: return None
+    arr = np.asarray(ids, dtype=np.int64); best = None
+    for slot, rec in parked.items():
+        h = rec["hist"]; L = min(len(h), len(arr))
+        if L < args.reuse_min: continue
+        neq = np.flatnonzero(h[:L] != arr[:L]); c = int(neq[0]) if len(neq) else L
+        Pv = min(rec["P"], len(h))
+        if c >= Pv - 8 and min(c, Pv) <= len(arr) - 1: p, mode = min(c, Pv), "a"
+        elif rec["snap"] and c >= rec["plen"] and rec["plen"] <= len(arr) - 1 and rec["written"] - rec["plen"] <= 1000: p, mode = rec["plen"], "b"
+        else: continue
+        if p >= args.reuse_min and (best is None or p > best[1]): best = (slot, p, mode)
+    return best
+
 def try_admit():
-    while not pending.empty() and free_slots:
+    while not pending.empty() and len(active) + len(prefilling) < S:
         req = pending.queue[0]
+        if getattr(req, "cancelled", False):
+            pending.get(); STATS['aborted'] += 1; continue
         need = (len(req.ids) + req.max_tokens + 24 + PS - 1) // PS
-        if need > len(free_pages) or need > pt_len - 2:
-            if need > pt_len - 2 or need > NP - 1:
-                pending.get(); emit(req, ("error", "request longer than the KV cache / max_model_len")); continue
-            break
-        pending.get()
-        req.slot = free_slots.pop(0)
-        req.pages = [free_pages.pop() for _ in range(need)]
+        if need > pt_len - 2 or need > NP - 1:
+            pending.get(); emit(req, ("error", "request longer than the KV cache / max_model_len")); continue
+        m = match_parked(req.ids) if REUSE and not getattr(req, "no_reuse", False) else None
+        if m is not None:
+            slot, p, mode = m
+            rec = parked.pop(slot)
+            pages = rec["pages"]
+            if len(pages) >= need:
+                free_pages.extend(pages[need:]); pages = pages[:need]
+            else:
+                more = take_pages(need - len(pages))
+                if more is None:          # not enough KV: put the session back and wait
+                    parked[slot] = rec; parked.move_to_end(slot, last=False); break
+                pages = pages + more
+            pending.get()
+            req.slot, req.pages, req.done_prompt, req.restore = slot, pages, p, mode == "b"
+            STATS['pre_cached_tok'] += p; STATS['reuse_' + mode] += 1
+        else:
+            if not free_slots and not evict_one(): break
+            pages = take_pages(need)
+            if pages is None: break
+            pending.get()
+            req.slot = free_slots.pop(0); req.pages = pages; req.restore = False
         prefilling.append(req)
+        if args.mixed: admitted.append(req)
 
 def finish(req, reason):
     req.finish = reason
     active.pop(req.slot, None)
-    free_slots.append(req.slot); free_pages.extend(req.pages)
+    if REUSE and req.first_token_time is not None:
+        # park the session: its slot keeps rings + pages for a request that extends this history
+        hist = np.asarray(req.ids + req.gen, dtype=np.int64)
+        P = int(P_all[req.slot].item())
+        parked[req.slot] = dict(hist=hist, P=P, plen=len(req.ids), written=P + 8, pages=req.pages, snap=getattr(req, "snapped", False))
+    else:
+        free_slots.append(req.slot); free_pages.extend(req.pages)
     emit(req, ("done", reason))
 
 def scheduler():
@@ -342,6 +500,15 @@ def scheduler():
     while True:
         try_admit()
         did = False
+        if args.mixed:
+            while admitted:
+                req = admitted.pop(0)
+                bcast([OP_PAGES, req.slot, len(req.pages), 0, 0, 0, len(req.pages), 0], req.pages)
+                do_pages(HDR.tolist(), PAY[:len(req.pages)], None)
+                if getattr(req, "restore", False):          # session reuse at the previous prompt end: conv rings back
+                    bcast([OP_RESTORE, req.slot, 1, 0, 0, 0, 0, 0]); do_snap(HDR.tolist(), None, None)
+        if args.mixed and prefilling:
+            mixed_round(); continue
         if prefilling:
             req = prefilling[0]
             n = min(args.chunk, len(req.ids) - req.done_prompt)
@@ -352,8 +519,10 @@ def scheduler():
             tp0 = time.time()
             t, _, _ = bcast(h, pay, [req.temperature] if last else None)
             res = do_prefill(HDR.tolist(), PAY[:len(pay)], FPAY[:1 if last else 0])
+            torch.cuda.synchronize()        # bill the chunk's GPU time to prefill (else the next decode step absorbs it)
             req.done_prompt += n
             STATS['pre_time'] += time.time() - tp0; STATS['pre_tok'] += n
+            if active: STATS['stall_time'] += time.time() - tp0       # decoding requests waited for this prefill chunk
             if last:
                 prefilling.pop(0)
                 req.first_token_time = time.time()
@@ -390,15 +559,66 @@ def scheduler():
             if time.time() - last_hb > 1.0:
                 bcast([OP_NOOP]); last_hb = time.time()
 
+def mixed_round():
+    """one mixed step: all active slots' speculative verify + prefill chunks of pending prompts under the token budget"""
+    for req in [r for r in prefilling if getattr(r, "cancelled", False)]:     # client gone during its prefill
+        prefilling.remove(req); free_slots.append(req.slot); free_pages.extend(req.pages); STATS['aborted'] += 1
+    if not prefilling and not active:
+        return
+    slots = sorted(active)
+    nact = len(slots)
+    R = spec_k(next(b for b in BUCKETS if b >= nact)) + 1 if nact else 0
+    left = min(args.prefill_budget, args.max_step_rows - nact * R) if nact else args.chunk
+    segs = []
+    for req in prefilling:
+        if left <= 0 or len(segs) >= 16: break
+        n = min(left, len(req.ids) - req.done_prompt, args.chunk)
+        segs.append((req, req.done_prompt, n, req.done_prompt + n == len(req.ids)))
+        left -= n
+    ids = [t for req, st, n, _ in segs for t in req.ids[st:st + n]]
+    pay = slots + [x for req, st, n, last in segs for x in (req.slot, st, n, int(last))] + ids
+    h = [OP_MIXED, nact, len(segs), len(ids), 0, 0, len(pay), len(segs)]
+    t0 = time.time()
+    bcast(h, pay, [req.temperature for req, _, _, _ in segs])
+    (emit_t, n_t), first = do_mixed(HDR.tolist(), PAY[:len(pay)], FPAY[:len(segs)])
+    dt = time.time() - t0
+    STATS['mix_steps'] += 1; STATS['mix_time'] += dt; STATS['mix_pre_tok'] += len(ids)
+    STATS['mix_rows'] += nact; STATS['mix_tok'] += (int(n_t.sum()) + nact) if nact else 0
+    STATS['mix_dsteps'] += 1 if nact else 0          # mixed steps that also decoded
+    if not nact: STATS['pre_time'] += dt; STATS['pre_tok'] += len(ids)
+    for i, s in enumerate(slots):
+        req = active.get(s)
+        if req is not None:
+            handle_tokens(req, emit_t[i, :int(n_t[i]) + 1].tolist())
+    for req, st, n, last in segs:
+        req.done_prompt += n
+        if last and REUSE:                                   # conv rings at prompt end (restore point (b) for a successor)
+            bcast([OP_SNAP, req.slot, 0, 0, 0, 0, 0, 0]); do_snap(HDR.tolist(), None, None); req.snapped = True
+        if last:
+            prefilling.remove(req)
+            req.first_token_time = time.time()
+            active[req.slot] = req
+            handle_tokens(req, [first[req.slot]])
+
 def handle_tokens(req, toks):
+    if getattr(req, "cancelled", False) and req.slot in active and not req.finish:
+        finish(req, "abort"); STATS['aborted'] += 1; return
+    out = []
+    def flush():
+        if out:
+            if args.sse_batch: emit(req, ("toks", list(out)))
+            else:
+                for t_ in out: emit(req, ("tok", t_))
+            out.clear()
     for t in toks:
-        if req.slot not in active or req.finish: return
-        if t in (T_EOS, 199999):
-            finish(req, "stop"); return
+        if req.slot not in active or req.finish: break
+        if t in (T_EOS, 199999) and not req.ignore_eos:
+            flush(); finish(req, "stop"); return
         req.gen.append(t)
-        emit(req, ("tok", t))
+        out.append(t)
         if len(req.gen) >= req.max_tokens:
-            finish(req, "length"); return
+            flush(); finish(req, "length"); return
+    flush()
 
 # ---------------------------------------------------------------------------------------------------------- output parsing
 class Parser:
@@ -418,9 +638,12 @@ class Parser:
                 body = self._text()
                 try:
                     obj = json.loads(body)
+                    STATS['tool_ok'] += 1
                     out.append(("tool", {"index": self.tool_idx, "id": "call_" + uuid.uuid4().hex[:20], "type": "function",
                                          "function": {"name": obj.get("name", ""), "arguments": json.dumps(obj.get("args", {}))}}))
-                except Exception:
+                except Exception as e:
+                    STATS['tool_bad'] += 1
+                    print(f"TOOL_JSON_BAD body_len={len(body)} err={type(e).__name__}: {str(e)[:80]}", flush=True)   # no content logged
                     out.append(("content", body))
                 self.tool_idx += 1
             else:
@@ -444,8 +667,22 @@ class Parser:
         if self.mode in ("text", "think"): out += self._flush(final=True)
         return out
 
+_EFFORT_NAMES = {"none": 0.0, "off": 0.0, "minimal": 0.2, "low": 0.4, "medium": 0.6, "high": 0.9, "xhigh": 0.99, "max": 0.99}
+
+def norm_effort(e):
+    """Inkling's template wants a float in [0, 0.99]; clients (Pi/OMP) send names or numeric strings."""
+    if e is None or isinstance(e, bool): return None
+    if isinstance(e, str):
+        s = e.strip().lower()
+        if s in _EFFORT_NAMES: return _EFFORT_NAMES[s]
+        try: e = float(s)
+        except ValueError: return None
+    try: return min(max(float(e), 0.0), 0.99)
+    except (TypeError, ValueError): return None
+
 def render_prompt(messages, tools, reasoning_effort):
     kw = dict(messages=messages, tools=tools or None, add_generation_prompt=True)
+    reasoning_effort = norm_effort(reasoning_effort)
     if reasoning_effort is not None: kw["reasoning_effort"] = reasoning_effort
     return template.render(**kw)
 
@@ -455,7 +692,7 @@ def encode(text):
 app = FastAPI()
 
 @app.get("/health")
-async def health(): return {"status": "ok", "stats": STATS, "spec": SPEC, "kv_tokens": NP * PS, "active": len(active), "queued": pending.qsize()}
+async def health(): return {"status": "ok", "stats": STATS, "spec": SPEC, "kv_tokens": NP * PS, "active": len(active), "queued": pending.qsize(), "parked": len(parked)}
 
 @app.get("/v1/models")
 async def models(): return {"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local"}]}
@@ -464,6 +701,8 @@ def norm_messages(msgs):
     out = []
     for m in msgs:
         m = dict(m)
+        if m.get("role") == "developer":      # OpenAI's newer name for the system message (Pi / OMP send it)
+            m["role"] = "system"
         if isinstance(m.get("content"), list):
             parts = []
             for p in m["content"]:
@@ -481,7 +720,9 @@ def norm_messages(msgs):
 async def run_request(body, chat):
     loop = asyncio.get_running_loop()
     loop_ref["loop"] = loop
-    if chat:
+    if chat and body.get("raw_prompt"):      # extension: pre-rendered prompt in the model's chat format (eval harness)
+        prompt = body["raw_prompt"]
+    elif chat:
         prompt = render_prompt(norm_messages(body["messages"]), body.get("tools"), body.get("reasoning_effort"))
     else:
         prompt = body["prompt"] if isinstance(body["prompt"], str) else body["prompt"][0]
@@ -490,6 +731,8 @@ async def run_request(body, chat):
     temp = float(body.get("temperature", 0.0) or 0.0)
     out_q = asyncio.Queue()
     req = Req(ids, max_tokens, temp, out_q)
+    req.no_reuse = bool(body.get("no_reuse"))          # extension (tests): force a cold prefill
+    req.ignore_eos = bool(body.get("ignore_eos"))          # vLLM extension (benchmarks): decode to max_tokens past EOS
     pending.put(req)
     return req, out_q, len(ids)
 
@@ -503,13 +746,27 @@ async def chat_completions(request: Request):
     def chunk(delta, finish=None):
         return {"id": req.id, "object": "chat.completion.chunk", "created": created, "model": args.served_name,
                 "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+    so = body.get("stream_options") or {}
+    cont_usage = bool(so.get("continuous_usage_stats"))   # vLLM: cumulative usage on every streamed chunk
+    ntok_seen = [0]
     async def events():
         sent_role = False
         has_tool = False
         while True:
             kind, val = await out_q.get()
-            if kind == "tok":
-                for k, v in parser.feed(val):
+            if kind in ("tok", "toks"):
+                vals = val if kind == "toks" else [val]
+                ntok_seen[0] += len(vals)
+                out = [kv for t_ in vals for kv in parser.feed(t_)]
+                if kind == "toks":          # one merged delta per step: text pieces joined, tool calls kept separate
+                    merged = []
+                    for k, v in out:
+                        if merged and k in ("reasoning", "content") and merged[-1][0] == k: merged[-1] = (k, merged[-1][1] + v)
+                        else: merged.append((k, v))
+                    out = merged
+                if not out and cont_usage:
+                    yield {}, None          # tokens without visible text still advance the usage count
+                for k, v in out:
                     d = {}
                     if not sent_role: d["role"] = "assistant"; sent_role = True
                     if k == "reasoning": d["reasoning_content"] = v
@@ -526,9 +783,17 @@ async def chat_completions(request: Request):
                 return
     if stream:
         async def gen():
+          try:
             async for d, fin in events():
-                yield f"data: {json.dumps(chunk(d, fin))}\n\n"
+                c = chunk(d, fin)
+                if fin is not None:
+                    c["usage"] = {"prompt_tokens": nprompt, "completion_tokens": len(req.gen), "total_tokens": nprompt + len(req.gen)}
+                elif cont_usage:
+                    c["usage"] = {"prompt_tokens": nprompt, "completion_tokens": ntok_seen[0], "total_tokens": nprompt + ntok_seen[0]}
+                yield f"data: {json.dumps(c)}\n\n"
             yield "data: [DONE]\n\n"
+          finally:          # client gone (generator closed / cancelled) before the request finished: stop decoding it
+            if req.finish is None: req.cancelled = True
         return StreamingResponse(gen(), media_type="text/event-stream")
     content, reasoning, tools, fin = "", "", [], "stop"
     async for d, f in events():
@@ -538,9 +803,12 @@ async def chat_completions(request: Request):
     msg = {"role": "assistant", "content": content or None}
     if reasoning: msg["reasoning_content"] = reasoning
     if tools: msg["tool_calls"] = tools
-    return {"id": req.id, "object": "chat.completion", "created": created, "model": args.served_name,
-            "choices": [{"index": 0, "message": msg, "finish_reason": fin}],
-            "usage": {"prompt_tokens": nprompt, "completion_tokens": len(req.gen), "total_tokens": nprompt + len(req.gen)}}
+    out = {"id": req.id, "object": "chat.completion", "created": created, "model": args.served_name,
+           "choices": [{"index": 0, "message": msg, "finish_reason": fin}],
+           "usage": {"prompt_tokens": nprompt, "completion_tokens": len(req.gen), "total_tokens": nprompt + len(req.gen)}}
+    if body.get("return_token_ids"):
+        out["token_ids"] = list(req.gen)
+    return out
 
 @app.post("/v1/completions")
 async def completions(request: Request):

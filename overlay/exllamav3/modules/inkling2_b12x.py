@@ -17,7 +17,8 @@ rotation input, expert_map for the EP slice (global id -> local id or -1), route
 from __future__ import annotations
 import os, sys
 import torch
-from .inkling2_gemm import route_sigmoid_topk
+from .inkling2_gemm import route_sigmoid_topk, route_sigmoid_topk_tiled
+_ROUTE_TILED = os.environ.get("I2_ROUTE_TILED", "1") == "1"
 
 _FI = os.environ.get("I2_B12X_PATH", "/opt/flashinfer")
 
@@ -34,8 +35,17 @@ def _import_b12x():
 
 # (fc1_tile_k, fc1_tile_n, fc2_tile_k, fc2_tile_n) per verify row count; override with I2_B12X_TILES="T:a,b,c,d;..."
 DEFAULT_TILE = (128, 128, 32, 512)
-DEFAULT_TILES = {5: (128, 128, 64, 256), 8: (128, 128, 64, 256)}   # all-48-layer realistic-routing sweep (serving/t_moe_sweep_all.py)
+DEFAULT_TILES = {5: (128, 128, 64, 256), 8: (128, 128, 64, 256),   # all-48-layer realistic-routing sweep (serving/t_moe_sweep_all.py)
+                 512: (128, 128, 64, 256),
+                 # prefill chunks, 48-row route blocks (prefill-moe, serving_moe/moe_bench.py on real routing, layer 24 rank 0
+                 # at 300 W, vs 32-row blocks + (128, 128, 64, 256)): T=1024 2.00 -> 1.71-1.88 ms, T=2048 3.91 -> 3.44-3.78,
+                 # T=4096 7.40 -> 6.24 ms; fc1 tile_n must divide I/rank = 1152 and bm 64 needs 128-thread tiles (no gain)
+                 1024: (64, 128, 64, 128), 2048: (128, 128, 64, 256), 4096: (128, 128, 64, 256)}
 DEFAULT_STAGES = {12: 4}                                            # pipeline stages override per T (same sweep)
+# route block rows per prefill size (I2_B12X_BM): at T=512 every local expert gets ~11 rows, so 8-row blocks decode each
+# expert twice; 16-row blocks: 1838 vs 2785 us/layer (192 experts, 300 W). T=128/256 stay at 8 (1562/1611 vs 1693/1727)
+DEFAULT_PREFILL_BM = {512: 16, 1024: 48, 2048: 48, 4096: 48}   # see DEFAULT_TILES (skip-empty 16-row MMA sub-blocks keep the
+                                                             # padding cost of 48-row blocks low; bm 64 measured no better)
 
 
 def _tiles_from_env():
@@ -215,7 +225,7 @@ def strip_experts(model):
 
 
 class B12xMoEShard:
-    PREFILL_SIZES = (64, 128, 256, 512)
+    PREFILL_SIZES = tuple(int(x) for x in os.environ.get("I2_B12X_PREFILL_SIZES", "64,128,256,512,1024,2048,4096").split(",") if x)
 
     def __init__(self, model_dir, cfg, layer_ids, dev, rank, world, groups = 2, sizes = (5, 8, 12, 24, 48)):
         import json
@@ -233,8 +243,23 @@ class B12xMoEShard:
         bounds = [0, n0, E_all] if groups == 2 else [k * E_all // groups for k in range(groups + 1)]
         self.lo, self.hi = bounds[g], bounds[g + 1]
         Eg = self.hi - self.lo
+        # I2_EP_PARTITION: JSON {"layers": {"<layer>": [group-0 expert ids]}} (equal-size groups), e.g. balanced on routing
+        # statistics; the default is the contiguous split above. Group g's experts of layer LI are self.groups[LI]
+        ep_part = json.load(open(os.environ["I2_EP_PARTITION"]))["layers"] if os.environ.get("I2_EP_PARTITION") else None
+        def group_of(LI):
+            if ep_part is None or str(LI) not in ep_part: return list(range(self.lo, self.hi))
+            g0 = sorted(int(e) for e in ep_part[str(LI)])
+            assert groups == 2 and len(g0) == E_all // 2, "partition: two equal groups"
+            return g0 if g == 0 else sorted(set(range(E_all)) - set(g0))
+        self.groups = {}
         self.E_all, self.E, self.H, self.I = E_all, Eg, H, Ih
-        self.block_m = 8
+        # route block rows per batch size: an expert with r rows is decoded ceil(r / block_m) times, so prefill sizes can use
+        # bigger blocks (b12x has block-32/64 prefill specializations); I2_B12X_BM="T:bm;..." overrides
+        self.block_m = int(os.environ.get("I2_B12X_BLOCK_M", 8))
+        self.bms = {T: self.block_m for T in tuple(sizes) + self.PREFILL_SIZES}
+        self.bms.update(DEFAULT_PREFILL_BM)
+        for part in filter(None, os.environ.get("I2_B12X_BM", "").split(";")):
+            k, v = part.split(":"); self.bms[int(k)] = int(v)
         wm = json.load(open(model_dir + "/model.safetensors.index.json"))["weight_map"]
         handles = {}
         def get(key, sl = None):
@@ -251,7 +276,8 @@ class B12xMoEShard:
         for LI in layer_ids:
             pre = f"model.llm.layers.{LI}.mlp."
             K = None
-            for e_i, e in enumerate(range(self.lo, self.hi)):
+            self.groups[LI] = group_of(LI)
+            for e_i, e in enumerate(self.groups[LI]):
                 p = pre + f"experts.{e}."
                 gt = get(p + "gate_proj.trellis", (slice(None), slice(h * n16, (h + 1) * n16)))
                 ut = get(p + "up_proj.trellis", (slice(None), slice(h * n16, (h + 1) * n16)))
@@ -277,19 +303,36 @@ class B12xMoEShard:
             self.router_w[LI] = get(pre + "gate.weight").to(torch.float16).contiguous().to(dev)       # [E, K]
             self.router_b[LI] = get(pre + "gate.bias").float().to(dev)
         self.K = K
-        self.expert_map = torch.full((E_all,), -1, dtype = torch.int32, device = dev)
-        self.expert_map[self.lo:self.hi] = torch.arange(Eg, dtype = torch.int32, device = dev)
-        self.pad_expert = self.hi if self.hi < E_all else 0   # an expert of another group: maps to -1 (skipped) on this rank
+        # per layer: global expert id -> local index (or -1 = another group), and a pad expert of another group
+        self.expert_maps, self.pad_experts = {}, {}
+        for LI, gl in self.groups.items():
+            m = torch.full((E_all,), -1, dtype = torch.int32, device = dev)
+            m[torch.tensor(gl, dtype = torch.long, device = dev)] = torch.arange(len(gl), dtype = torch.int32, device = dev)
+            self.expert_maps[LI] = m
+            self.pad_experts[LI] = next(e for e in range(E_all) if e not in set(gl))
+        self.expert_map = self.expert_maps[next(iter(self.groups))]
+        self.pad_expert = self.pad_experts[next(iter(self.groups))]
         props = torch.cuda.get_device_properties(dev)
         lay0 = next(iter(self.layers.values()))
         self.sizes = {}
-        for T in sorted(set(sizes) | set(self.PREFILL_SIZES)):
+        # prefill sizes (eager, never two at once on the stream) share one set of scratch buffers: each field is a prefix
+        # view of the largest size's field. Separate buffers for 64..4096 cost ~3 GB/GPU of KV pages (I2_B12X_SHARE_BUF=0: off).
+        share = os.environ.get("I2_B12X_SHARE_BUF", "1") == "1"
+        share_min = int(os.environ.get("I2_B12X_SHARE_MIN", 256))
+        big = None
+        for T in sorted(set(sizes) | set(self.PREFILL_SIZES), reverse = True):
             tile_T = self.tiles[T]
+            bm = self.bms.get(T, self.block_m)
             tier = lay0.tier_for(tile_T)
             buf = self.make_buffers(tier, m = T, topk = self.topk, dtype = torch.float16, device = dev,
-                                    route_num_experts = E_all, full_rotation = True, block_size_m = self.block_m)
+                                    route_num_experts = E_all, full_rotation = True, block_size_m = bm)
+            if share and T >= share_min:
+                if big is None:
+                    big = buf
+                else:
+                    buf = _share_prefix(buf, big)
             launch = self.compile_moe(size_m = T, hidden_size = H, intermediate_size = Ih, num_experts = Eg, top_k = self.topk,
-                activation = "situ", apply_router_weight_on_input = False, zero_fc2_output = False, moe_block_size = self.block_m,
+                activation = "situ", apply_router_weight_on_input = False, zero_fc2_output = False, moe_block_size = bm,
                 max_m_blocks = int(buf.block_expert_ids.numel()), element_dtype = "fp16", sms = int(props.multi_processor_count),
                 max_shared_mem = int(props.shared_memory_per_block_optin), weight_layout = "trellis_t256", scale_format = "e4m3_k32",
                 w13_layout = "trellis_t256_proj", trellis_bits = int(K), trellis_codebook = "mcg", force_tile_config = tile_T,
@@ -297,38 +340,86 @@ class B12xMoEShard:
                 pipeline_stages = DEFAULT_STAGES.get(T))
             tsum = self.compile_sum(m = T, topk = self.topk, hidden_size = H, element_dtype = "fp16", full_rotation = True,
                                     num_experts = Eg, route_num_experts = E_all, route_ids_dtype = torch.int32, use_expert_map = True)
-            self.sizes[T] = (buf, launch, tsum, (tile_T[1], tile_T[3]))
+            self.sizes[T] = (buf, launch, tsum, (tile_T[1], tile_T[3]), bm)
+        if share:
+            torch.cuda.empty_cache()      # the replaced per-size buffers go back to the device (KV sizing reads free memory)
         self.record = None
+        # I2_PREFILL_MOE=tmoe: prefill batches >= I2_TMOE_MIN_T rows send experts with >= I2_TMOE_HOT routed rows through
+        # the Triton big-tile trellis GEMMs (inkling2_tmoe.py); the rest stay on b12x. Decode / verify sizes unchanged.
+        self.tmoe = None
+        if os.environ.get("I2_PREFILL_MOE", "b12x") == "tmoe":
+            from .inkling2_tmoe import TritonMoE
+            assert ep_part is None, "I2_PREFILL_MOE=tmoe assumes contiguous expert groups (lo..hi); unset I2_EP_PARTITION"
+            self.tmoe_min_t = int(os.environ.get("I2_TMOE_MIN_T", 1024))
+            self.tmoe = TritonMoE(self.layers, H, Ih, Eg, self.lo, self.hi, self.topk, dev,
+                                  BM=int(os.environ.get("I2_TMOE_BM", 128)), BK=int(os.environ.get("I2_TMOE_BK", 64)),
+                                  stages=int(os.environ.get("I2_TMOE_STAGES", 3)), warps=int(os.environ.get("I2_TMOE_WARPS", 8)),
+                                  hot_rows=int(os.environ.get("I2_TMOE_HOT", 128)))
+            self.hot_g = torch.zeros(E_all, dtype = torch.bool, device = dev)
 
     def supports(self, T):
         return T <= max(self.sizes)
 
+    def route(self, layer_idx, x):
+        """top-k expert ids [T, k] int32 and weights [T, k] fp32 of the MoE input rows x [T, H] fp16 (row-local math)"""
+        T = x.shape[0]
+        if T <= 64 or _ROUTE_TILED:     # Triton router in 64-row tiles (fp32 SIMT sgemm in _route_large cost ~7 ms per 512-row chunk)
+            return route_sigmoid_topk_tiled(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale)
+        return _route_large(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale)
+
     def forward(self, layer_idx, mlp, x, out_dtype = torch.float32):
+        ids, w = self.route(layer_idx, x)
+        return self.run_routed(layer_idx, x, ids, w, out_dtype)
+
+    def run_routed(self, layer_idx, x, ids, w, out_dtype = torch.float32):
+        """routed-expert sum of this rank's slice for rows x [T, H] fp16 with given routes (ids int32, w fp32 [T, k])"""
         T = x.shape[0]
         S = next(s for s in sorted(self.sizes) if s >= T)
-        buf, launch, tsum, tkey = self.sizes[S]
+        buf, launch, tsum, tkey, bm = self.sizes[S]
         tier = self.layers[layer_idx].tiers[tkey]
-        ids, w = route_sigmoid_topk(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale) \
-            if T <= 64 else _route_large(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale)
         if self.record is not None:
             self.record.append((layer_idx, ids.long().clone()))
         if S != T:
             xp = torch.zeros((S, x.shape[1]), dtype = x.dtype, device = x.device); xp[:T] = x
-            ip = torch.full((S, self.topk), self.pad_expert, dtype = torch.int32, device = x.device); ip[:T] = ids
+            ip = torch.full((S, self.topk), self.pad_experts[layer_idx], dtype = torch.int32, device = x.device); ip[:T] = ids
             wp = torch.zeros((S, self.topk), dtype = torch.float32, device = x.device); wp[:T] = w
             x, ids, w = xp, ip, wp
+        P = None
+        if self.tmoe is not None and T >= self.tmoe_min_t:
+            P = self.tmoe.plan(ids, w, S)
+            self.hot_g[self.lo:self.hi] = P["hot_global"]
+            ids = torch.where(self.hot_g[ids.long()], torch.full_like(ids, self.pad_expert), ids)
         out = self.run(x, tier, w, ids, activation = "situ", intermediate_cache13 = buf.intermediate_cache13,
             intermediate_cache2 = buf.intermediate_cache2, output = buf.output, fc1_c_tmp = buf.fc1_c_tmp,
             fc2_c_tmp = buf.fc2_c_tmp, packed_route_indices = buf.packed_route_indices,
             block_expert_ids = buf.block_expert_ids, packed_route_count = buf.packed_route_count,
-            expert_offsets = buf.expert_offsets, expert_counts = buf.expert_counts, expert_map = self.expert_map,
-            output_expert_map = self.expert_map, fused_launch = launch, topk_sum_launch = tsum,
-            route_block_size_m = self.block_m, intermediate_rotation_scales = tier.intermediate_rotations,
+            expert_offsets = buf.expert_offsets, expert_counts = buf.expert_counts, expert_map = self.expert_maps[layer_idx],
+            output_expert_map = self.expert_maps[layer_idx], fused_launch = launch, topk_sum_launch = tsum,
+            route_block_size_m = bm, intermediate_rotation_scales = tier.intermediate_rotations,
             full_rotation = True, suh_gate_table = tier.gate_suh, suh_up_table = tier.up_suh,
             svh_table = tier.down_svh, rotation_a_gate = buf.rotation_a_gate, rotation_a_up = buf.rotation_a_up)
+        if P is not None:
+            base = (out if out is not None else buf.output).view(S, -1)[:, :self.H]
+            y = self.tmoe.run(layer_idx, x, P, S, base = base, out_dtype = out_dtype)[:T]
+            return y
         y = (out if out is not None else buf.output).view(S, -1)[:T, :self.H]
         y = y.contiguous()
         return y if y.dtype == out_dtype else y.to(out_dtype)
+
+
+def _share_prefix(buf, big):
+    """buf with every tensor field replaced by a same-shape prefix view of big's field (same dtype, contiguous, fits),
+    zero-filled like a fresh allocation; fields that don't fit keep their own storage"""
+    import dataclasses
+    rep = {}
+    for f in dataclasses.fields(buf):
+        t, b = getattr(buf, f.name), getattr(big, f.name)
+        if (isinstance(t, torch.Tensor) and isinstance(b, torch.Tensor) and t.dtype == b.dtype and t.is_contiguous()
+                and b.is_contiguous() and t.numel() <= b.numel()):
+            v = b.view(-1)[:t.numel()].view(t.shape)
+            v.copy_(t)
+            rep[f.name] = v
+    return dataclasses.replace(buf, **rep)
 
 
 class _ShardLayer:

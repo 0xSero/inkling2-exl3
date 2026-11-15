@@ -13,7 +13,8 @@ import triton.language as tl
 from safetensors import safe_open
 
 BLOCK = 8                 # anchor + 7 masks
-RINGD = 1024 + 8 + 56     # local-layer draft KV ring (positions modulo RINGD)
+# local-layer draft KV ring (positions modulo RINGD); session reuse needs window + previous generation (server: 2112)
+RINGD = int(__import__('os').environ.get('I2_DRAFT_RINGD', 1024 + 8 + 56))
 
 
 def rms(x, w, eps = 1e-6):
@@ -146,10 +147,16 @@ class I2Draft:
                     del L[k]
             torch.cuda.empty_cache()
         self.markov_fused = __import__("os").environ.get("I2_MARKOV_FUSED", "1") == "1"
+        # fused Triton kernels for the per-layer norm/rope/KV-write/residual chains (inkling2_draft_ops.py)
+        self.fused = __import__("os").environ.get("I2_DRAFT_FUSED", "1") == "1"
         self._mstep = {}
         self.norm = g("norm.weight")
+        self.inv_freq = 1e6 ** (-torch.arange(0, 128, 2, device = device, dtype = torch.float32) / 128)    # as rope_neox
+        self.w5 = torch.stack([L["dflare"] for L in self.L]).contiguous()                                    # store_context mixes
         self.mask_embed = g("mask_embed")
         self.fuse_alpha = torch.softmax(g("fuse_weight").float(), -1)          # [6, 8]
+        self.alpha5 = self.fuse_alpha[:5].contiguous()
+        eng.draft_ref = self            # token-sharded prefill stores the context itself (forward_sharded -> store_ctx_parts)
         mh = "markov_head."
         self.m_dflare = g(mh + "dflare_norm.weight")
         self.w1 = g(mh + "markov_w1.weight")                                  # [V, 256]
@@ -215,7 +222,29 @@ class I2Draft:
 
     def store_context(self, feats, slot, pos):
         """feats [R, 8, D], slot/pos [R] int32: write the context K/V (all 5 layers) of the target features"""
+        if getattr(self.eng, "ctx_stored", None) is feats:     # already stored by the token-sharded prefill
+            self.eng.ctx_stored = None
+            return
         R = feats.shape[0]
+        if self.fused:
+            from .inkling2_draft_ops import mix_rms, qk_rope_write
+            ctx = mix_rms(feats, self.alpha5, self.w5)                  # [5, R, D]: the 5 layers' mixes in one pass
+            keep = None
+            if R > RINGD:        # long call: per sequence, only its last RINGD rows can be read from the local-layer rings
+                mx = torch.full((self.max_slots,), -1, dtype=pos.dtype, device=pos.device).scatter_reduce(0, slot.long(), pos, "amax")
+                keep = torch.nonzero(pos > mx[slot.long()] - RINGD).flatten()
+            for i, L in enumerate(self.L):
+                if i in self.LOCAL and keep is not None:
+                    kv = torch.mm(ctx[i][keep], L["wkv_ctx"].t())
+                    ks, vs = self.kvs[i] if self.kvs[i] is not None else (None, None)
+                    qk_rope_write(kv, 0, self.Hkl * 128, None, self.kv[i][0], self.kv[i][1], ks, vs, self.eng.page_table, slot[keep],
+                                  pos[keep], None, L["knc"], self.inv_freq, self.Hl, self.Hkl, False, RINGD, self.ps)
+                    continue
+                kv = torch.mm(ctx[i], L["wkv_ctx"].t())
+                ks, vs = self.kvs[i] if self.kvs[i] is not None else (None, None)
+                qk_rope_write(kv, 0, self.Hkl * 128, None, self.kv[i][0], self.kv[i][1], ks, vs, self.eng.page_table, slot,
+                              pos, None, L["knc"], self.inv_freq, self.Hl, self.Hkl, i not in self.LOCAL, RINGD, self.ps)
+            return
         full = feats, slot, pos
         for i, L in enumerate(self.L):
             feats, slot, pos = full
@@ -230,6 +259,22 @@ class I2Draft:
             k = rope_neox(k, pos)
             rows = self._cache_rows(i, slot, pos)
             self._write(i, rows, k, v.reshape(R, self.Hkl, 128))
+
+    def store_ctx_parts(self, ctx_g, ctx_l, slot, pos):
+        """token-sharded prefill of one sequence: ctx_g [T, D] = the global draft layer's mix of all rows, ctx_l [4, K, D]
+        = the local layers' mixes of the last K = min(T, RINGD) rows (the rows store_context keeps for them)"""
+        from .inkling2_draft_ops import qk_rope_write
+        K = ctx_l.shape[1]
+        li = 0
+        for i, L in enumerate(self.L):
+            if i in self.LOCAL:
+                c_, sl, ps = ctx_l[li], slot[-K:], pos[-K:]; li += 1
+            else:
+                c_, sl, ps = ctx_g, slot, pos
+            kv = torch.mm(c_, L["wkv_ctx"].t())
+            ks, vs = self.kvs[i] if self.kvs[i] is not None else (None, None)
+            qk_rope_write(kv, 0, self.Hkl * 128, None, self.kv[i][0], self.kv[i][1], ks, vs, self.eng.page_table, sl, ps, None,
+                          L["knc"], self.inv_freq, self.Hl, self.Hkl, i not in self.LOCAL, RINGD, self.ps)
 
     def attention(self, i, q, slot, pa, nsplit):
         B = slot.shape[0]
@@ -255,6 +300,8 @@ class I2Draft:
 
     def block_forward(self, anchor_tok, slot, pa, nsplit_g = 4, nsplit_l = 4):
         """anchor_tok [B] long, slot [B] int32, pa [B] int32 (anchor positions). Returns hidden [B*8, D] bf16"""
+        if self.fused:
+            return self._block_forward_fused(anchor_tok, slot, pa, nsplit_g, nsplit_l)
         B = slot.shape[0]
         D = 4608
         eng = self.eng
@@ -288,6 +335,32 @@ class I2Draft:
             xn = rms(res, self.L[i + 1]["ln_in"] if i + 1 < 5 else self.norm)
         return xn
 
+    def _block_forward_fused(self, anchor_tok, slot, pa, nsplit_g, nsplit_l):
+        from .inkling2_draft_ops import add_rms, silu_mul, qk_rope_write
+        B = slot.shape[0]
+        D = 4608
+        eng = self.eng
+        Hl, Hkl = self.Hl, self.Hkl
+        R = B * BLOCK
+        x = self.mask_embed.expand(B, BLOCK, D).clone()
+        x[:, 0] = eng.embed_tokens(anchor_tok)
+        res = x.view(R, D)
+        _, xn = add_rms(res, None, self.L[0]["ln_in"])
+        for i, L in enumerate(self.L):
+            qkv = self._mm(xn, L, "wqkv")
+            q = torch.empty((R, Hl * 128), dtype = torch.bfloat16, device = x.device)
+            ks, vs = self.kvs[i] if self.kvs[i] is not None else (None, None)
+            qk_rope_write(qkv, Hl * 128, (Hl + Hkl) * 128, q, self.kv[i][0], self.kv[i][1], ks, vs, eng.page_table, slot, pa,
+                          L["qn"], L["kn"], self.inv_freq, Hl, Hkl, i not in self.LOCAL, RINGD, self.ps, blk = BLOCK)
+            o = self.attention(i, q, slot, pa, nsplit_l if i in self.LOCAL else nsplit_g)
+            o = self._mm(o, L, "wo")
+            eng.allreduce(o)
+            res, xn = add_rms(res, o, L["ln_post"])
+            y = self._mm(silu_mul(self._mm(xn, L, "wgu")), L, "wd")
+            eng.allreduce(y)
+            res, xn = add_rms(res, y, self.L[i + 1]["ln_in"] if i + 1 < 5 else self.norm)
+        return xn
+
     def draft(self, anchor_tok, slot, pa, f_feats, nsplit_g = 4, nsplit_l = 4, K = 7):
         """Draft K (<= 7) tokens for B sequences. f_feats: [B, 8, D] target features of the last committed row.
         Returns tokens [B, K] (int64). The block forward always runs the full 8-row block (same numerics for any K)"""
@@ -296,7 +369,11 @@ class I2Draft:
         hid = self.block_forward(anchor_tok, slot, pa, nsplit_g, nsplit_l).view(B, BLOCK, -1)[:, 1:K + 1]   # [B, K, D]
         hid = hid.reshape(B * K, -1)
         base = torch.mm(hid, eng.head.unembed.t())                                                           # bf16 [B*K, V/w]
-        f_rnn = self.mix(f_feats, 5, self.m_dflare)                                                          # [B, D]
+        if self.fused:
+            from .inkling2_draft_ops import mix_rms
+            f_rnn = mix_rms(f_feats, self.fuse_alpha[5:6], self.m_dflare[None])[0]                            # [B, D]
+        else:
+            f_rnn = self.mix(f_feats, 5, self.m_dflare)                                                      # [B, D]
         Wc = self.rnn_w[:, 512:]
         inp = torch.cat([hid.view(B, K, -1), f_rnn[:, None].expand(B, K, -1)], -1).transpose(0, 1).reshape(K * B, -1)
         ctx = torch.addmm(self.rnn_b, inp, Wc.t(), out_dtype = torch.float32).view(K, B, -1)

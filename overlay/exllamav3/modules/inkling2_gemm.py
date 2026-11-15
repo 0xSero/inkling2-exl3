@@ -130,3 +130,12 @@ def route_sigmoid_topk(x, w_ek, bias, topk, scale, ks=8, bn=16, bk=128):
     wts = torch.empty((T, topk), dtype=torch.float32, device=x.device)
     _route_topk_kernel[(T,)](z, bias, ids, wts, E, T, float(scale), TOPK=topk, EP=triton.next_power_of_2(E), KS=ks, num_warps=4)
     return ids, wts
+
+
+def route_sigmoid_topk_tiled(x, w_ek, bias, topk, scale):
+    """route_sigmoid_topk for any T in 64-row tiles (prefill-sized batches): same per-row math as the decode router"""
+    T = x.shape[0]
+    if T <= 64:
+        return route_sigmoid_topk(x, w_ek, bias, topk, scale)
+    parts = [route_sigmoid_topk(x[s:s + 64], w_ek, bias, topk, scale) for s in range(0, T, 64)]
+    return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])

@@ -530,13 +530,105 @@ def _attn_combine_kernel(pm_ptr, pl_ptr, po_ptr, gate_ptr, o_ptr, stride_gate_t,
     tl.store(o_ptr + (t * HL + h) * DH + offs_d, o.to(tl.bfloat16))
 
 
+@triton.jit
+def _attn_prefill_kernel(
+    q_ptr, sink_ptr, kq_ptr, vq_ptr, ks_ptr, vs_ptr, page_table_ptr, pt_stride, slot_ptr, pos_ptr, qb_start_ptr, qb_len_ptr,
+    pm_ptr, pl_ptr, po_ptr, relq_ptr, relp_ptr,
+    stride_sink_t, cache_stride_pos, cache_stride_h, sc_stride_pos, sm_scale,
+    G: tl.constexpr, GP: tl.constexpr, BQ: tl.constexpr, DH: tl.constexpr, HKL: tl.constexpr, BN: tl.constexpr,
+    NSPLIT: tl.constexpr, BITS: tl.constexpr, PS: tl.constexpr, EXTENT: tl.constexpr, NG: tl.constexpr = 1, Q16: tl.constexpr = False,
+):
+    """global-layer attention for multi-row (prefill / mixed) batches: one program per (block of BQ consecutive rows of one
+    sequence, kv head, kv split); the rows share every K/V tile (M = BQ x GP query rows). Same math as _attn_kernel with the
+    fused relative bias (bias only evaluated on key blocks within EXTENT of the block's rows); same split partials"""
+    qb = tl.program_id(0)
+    hk = tl.program_id(1)
+    sp = tl.program_id(2)
+    t0 = tl.load(qb_start_ptr + qb)
+    nr = tl.load(qb_len_ptr + qb)
+    slot = tl.load(slot_ptr + t0)
+    HL: tl.constexpr = G * HKL
+    M: tl.constexpr = BQ * GP
+    offs_m = tl.arange(0, M)
+    ri = offs_m // GP
+    g = offs_m % GP
+    vm = (ri < nr) & (g < G)
+    tr = t0 + ri
+    hq = hk * G + g
+    offs_d = tl.arange(0, DH)
+    pos_r = tl.load(pos_ptr + tr, mask = ri < nr, other = 0)
+    q = tl.load(q_ptr + (tr * HL + hq)[:, None] * DH + offs_d[None, :], mask = vm[:, None], other = 0.0)
+    sink = tl.load(sink_ptr + tr * stride_sink_t + hq, mask = vm, other = 0.0).to(tl.float32)
+    pmax = tl.max(tl.where(ri < nr, pos_r, 0), 0)
+    pmin = tl.min(tl.where(ri < nr, pos_r, 2147483647), 0)
+    n = pmax + 1
+    nblk = (n + BN - 1) // BN
+    bps = (nblk + NSPLIT - 1) // NSPLIT
+    b0 = sp * bps
+    b1 = tl.minimum(b0 + bps, nblk)
+    if sp == 0:
+        m_i = sink
+        l_i = tl.full([M], 1.0, dtype = tl.float32)
+    else:
+        m_i = tl.full([M], -1e30, dtype = tl.float32)
+        l_i = tl.zeros([M], dtype = tl.float32)
+    acc = tl.zeros([M, DH], dtype = tl.float32)
+    rq_base = relq_ptr + (tr * HL + hq) * 16
+    for b in range(b0, b1):
+        j = b * BN + tl.arange(0, BN)
+        validk = j <= pmax
+        pg = tl.load(page_table_ptr + slot * pt_stride + j // PS, mask = validk, other = 0)
+        rows = pg.to(tl.int64) * PS + j % PS
+        k = _load_kv_tile(kq_ptr, ks_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, validk, offs_d, BITS, DH, NG, Q16)
+        s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * sm_scale
+        d = pos_r[:, None] - j[None, :]
+        valid = (d >= 0) & vm[:, None]
+        if b * BN + BN - 1 > pmin - EXTENT:          # some (row, key) pair of this block is within the bias extent
+            md = valid & (d < EXTENT)
+            bias = tl.zeros([M, BN], dtype = tl.float32)
+            for c in tl.static_range(16):
+                rqc = tl.load(rq_base + c, mask = vm, other = 0.0).to(tl.float32)
+                bias += rqc[:, None] * tl.load(relp_ptr + c * EXTENT + d, mask = md, other = 0.0)
+            s = s + bias
+        s = tl.where(valid, s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.exp(s - m_new[:, None])
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = _load_kv_tile(vq_ptr, vs_ptr, rows, hk, cache_stride_pos, cache_stride_h, sc_stride_pos, validk, offs_d, BITS, DH, NG, Q16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.float16), v.to(tl.float16))
+        m_i = m_new
+    pbase = (tr * HL + hq) * NSPLIT + sp
+    tl.store(pm_ptr + pbase, m_i, mask = vm)
+    tl.store(pl_ptr + pbase, l_i, mask = vm)
+    tl.store(po_ptr + pbase[:, None] * DH + offs_d[None, :], acc, mask = vm[:, None])
+
+
+def prefill_qblocks(nprev, nafter, bq):
+    """q blocks for _attn_prefill_kernel: start rows (nprev % bq == 0) and lengths (host sync: eager paths only)"""
+    starts = torch.nonzero(nprev % bq == 0).flatten().to(torch.int32)
+    lens = torch.clamp(nafter[starts.long()] + 1, max = bq).to(torch.int32)
+    return starts, lens
+
+
 def attention(q, R, sink, gate, kq, vq, ks, vs, page_table, slot, pos, scratch, o_out, cfg, is_global, bits, ring_size, ps,
-              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False, rel = None):
+              nsplit, hkl, g, bn = 64, rot = None, ng = 1, q16 = False, rel = None, qblocks = None, bq = 8):
     """rel: optional (rel_q [T, Hl, 16] bf16, rel_proj [16, EXTENT] fp32) -> relative bias computed in-kernel (R unused)"""
     """q: [T, Hl, 128] bf16, R: [T, Hl, 1024] fp32, sink: [T, Hl] view, gate: [T, Hl*128] view. Writes o_out [T, Hl*128] bf16"""
     T = q.shape[0]
     pm, pl, po = scratch
     HL = g * hkl
+    if qblocks is not None and is_global and rel is not None:
+        qs, ql = qblocks
+        _attn_prefill_kernel[(qs.shape[0], hkl, nsplit)](
+            q, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq, page_table, page_table.stride(0), slot, pos,
+            qs, ql, pm, pl, po, rel[0], rel[1], sink.stride(0), kq.stride(-3), kq.stride(-2),
+            (_sc_stride_pos(ks, ng) if ks is not None else 0), 128 ** -0.5,
+            G = g, GP = 8, BQ = bq, DH = 128, HKL = hkl, BN = bn, NSPLIT = nsplit, BITS = bits, PS = ps, EXTENT = cfg.rel_extent,
+            NG = ng, Q16 = q16, num_warps = 4)
+        _attn_combine_kernel[(T, HL)](pm, pl, po, gate, o_out, gate.stride(0), HL = HL, DH = 128, NSPLIT = nsplit,
+                                      rot_ptr = rot if rot is not None else gate, ROT = rot is not None)
+        return
     _attn_kernel[(T, hkl, nsplit)](
         q, R if R is not None else q, sink, kq, vq, ks if ks is not None else kq, vs if vs is not None else vq,
         page_table if page_table is not None else slot, page_table.stride(0) if page_table is not None else 0, slot, pos,

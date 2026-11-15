@@ -32,6 +32,24 @@ class Batch:
         self.T = slot.shape[0]
         self.multi = multi              # more than one row per sequence (prefill chunk / speculative verify)
         self.nsplit_g, self.nsplit_l = nsplit_g, nsplit_l
+        self.seqs = None                # optional host list [(first row, rows, first position, slot)] (prefill attention plan)
+
+    def host_seqs(self):
+        """sequences of the batch as host ints (one device sync unless the caller set .seqs)"""
+        if self.seqs is None:
+            starts = torch.nonzero(self.nprev == 0).flatten()
+            st = torch.stack([starts.int(), (self.nafter[starts] + 1).int(), self.pos[starts].int(), self.slot[starts].int()], 1).tolist()
+            self.seqs = [tuple(x) for x in st]
+        return self.seqs
+
+    def sub_seqs(self, r0, r1):
+        """host_seqs() restricted to batch rows [r0, r1), with row indices relative to r0"""
+        out = []
+        for (t0, n, p0, sl) in self.host_seqs():
+            a, b = max(t0, r0), min(t0 + n, r1)
+            if a < b:
+                out.append((a - r0, b - a, p0 + (a - t0), sl))
+        return out
 
 
 class I2Engine:
@@ -98,6 +116,53 @@ class I2Engine:
         self.ar_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[__import__('os').environ.get('I2_AR_DTYPE', 'fp16')]
         self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= 64 projections
         self.rel_fused = __import__('os').environ.get('I2_REL_FUSED', '1') == '1'   # relative bias inside the attention kernel
+        # query-blocked global attention for multi-row eager batches (prefill / mixed steps) of at least this many rows
+        self.attn_prefill_min = int(__import__('os').environ.get('I2_ATTN_PREFILL_MIN', 65))
+        self.attn_bq = int(__import__('os').environ.get('I2_ATTN_BQ', 8))
+        # SM120 CUDA prefill attention (inkling2_pattn) for both layer types on multi-row eager batches of at least
+        # pattn_min rows; needs the served KV formats (global 4-bit rot/q16/ng=4, SWA int8, 64-row pages)
+        self.pattn, self.pattn_min = None, int(__import__('os').environ.get('I2_PATTN_MIN', 65))
+        if (__import__('os').environ.get('I2_PATTN', '1') == '1' and bits_g == 4 and kv_rot and kv_q16 and kv_ng == 4
+                and bits_l == 8 and page_size == 64 and self.ring % 64 == 0 and self.Hl == 6 * self.Hkl):
+            try:
+                from .inkling2_pattn import PrefillAttn
+                self.pattn = PrefillAttn(device)
+            except Exception as e:
+                print(f"inkling2_pattn: build failed ({e}); using the Triton prefill attention", flush = True)
+        # PCIe P2P recursive-doubling all-reduce (inkling2_ar) for messages up to peer_ar_max bytes, NCCL above (prefill).
+        # Graph-captured 4-GPU fp16 [T, 4608]: T=5 6.8 us vs NCCL 15.3, T=12 10.0 vs 20.2, T=48 26 vs 45 (serving/t_ar.py)
+        self.peer_ar, self.peer_ar_max = None, int(__import__('os').environ.get('I2_PEER_AR_MAX', 640 << 10))
+        if world in (2, 4) and __import__('os').environ.get('I2_PEER_AR', '1') == '1':
+            from .inkling2_ar import PeerAllReduce
+            self.peer_ar = PeerAllReduce.create(rank, world, 2 * self.peer_ar_max)
+        # two-shot (reduce-scatter + all-gather, per-GPU barrier between rounds) for larger messages up to peer_big_max
+        # (prefill / mixed [<= 512, 4608] fp16): T=96 45 us vs NCCL 77, T=512 185 vs 191
+        self.peer_big, self.peer_big_max = None, int(__import__('os').environ.get('I2_PEER_BIG_MAX', 5 << 20))
+        if self.peer_ar is not None and world == 4 and self.peer_big_max > 0:
+            self.peer_big = PeerAllReduce.create(rank, world, self.peer_big_max // 2)
+        # token-sharded prefill (prefill-comm, I2_PC_SHARD=1): single-sequence multi-row calls of pc_min..pc_tmax rows run
+        # with every rank owning a quarter of the rows (forward_sharded); copy-engine ring all-gathers / reduce-scatters
+        self.pc = None
+        self.pc_min = int(__import__('os').environ.get('I2_PC_MIN', 256))
+        self.pc_tmax = int(__import__('os').environ.get('I2_PC_TMAX', 4096))
+        if world == 4 and __import__('os').environ.get('I2_PC_SHARD', '0') == '1':
+            from .inkling2_pc import PcComm
+            Tm, qm = self.pc_tmax, -(-self.pc_tmax // world) + 3
+            slab = 4 * Tm * D * 2 + 4 * int(__import__('os').environ.get('I2_DRAFT_RINGD', 1088)) * D * 2 + Tm * D * 2 + Tm * D // 16 + Tm * 8 * 8 + 3 * 2 * (world - 1) * qm * D * 2 + (8 << 20)    # 3 reduce-scatters (ra, rm, emb)
+            self.pc = PcComm.create(rank, world, slab, rs_rows = qm)
+            if self.pc is not None:       # regions in the same order on every rank (same slab offsets)
+                self._pcx = {3: self.pc.region("x3", (3, Tm, D), torch.bfloat16), 1: self.pc.region("x1", (1, Tm, D), torch.bfloat16)}
+                # expert-input packet rows on the wire: fp16 (exact) or int8 / fp8 codes + fp16 scale per 32 (I2_PC_PK)
+                self.pc_pk = __import__('os').environ.get('I2_PC_PK', 'fp16')
+                if self.pc_pk == "fp16":
+                    self._pkx = self.pc.region("pkx", (Tm, D), torch.float16)
+                else:
+                    self._pkq = self.pc.region("pkq", (Tm, D), torch.uint8)
+                    self._pks = self.pc.region("pks", (Tm, D // 32), torch.float16)
+                    self._pkx = torch.empty((Tm, D), dtype = torch.float16, device = dev)     # dequantized, local
+                self._pki = self.pc.region("pki", (Tm, c.topk), torch.int32)
+                self._pkw = self.pc.region("pkw", (Tm, c.topk), torch.float32)
+                self._pcred = [torch.empty((qm, D), dtype = self.ar_dtype, device = dev) for _ in range(2)]
         self.b12x = None          # optional inkling2_b12x.B12xMoE (b12x fused Trellis MoE for the prepared batch sizes)
         self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
 
@@ -119,7 +184,14 @@ class I2Engine:
 
     def allreduce(self, x):
         if self.world > 1 and not self._NO_AR:
-            dist.all_reduce(x)
+            p = self.peer_ar
+            n = x.numel() * x.element_size()
+            if p is not None and n <= self.peer_ar_max and p.fits(x):
+                p(x)
+            elif self.peer_big is not None and n <= self.peer_big_max and self.peer_big.fits_big(x):
+                self.peer_big.big(x)
+            else:
+                dist.all_reduce(x)
         return x
 
     # ---- embedding / head
@@ -131,7 +203,7 @@ class I2Engine:
             loc = ids - self.rank * self.embed_n
             ok = (loc >= 0) & (loc < self.embed_n)
             e = self.embed_w[loc.clamp(0, self.embed_n - 1)] * ok[:, None].to(self.embed_w.dtype)
-            dist.all_reduce(e)
+            self.allreduce(e)           # exact: one nonzero term per element
         return ops_rms_norm(e, self.embed.norm, c.eps)
 
     def head_hidden(self, h, blocks):
@@ -165,22 +237,40 @@ class I2Engine:
         return is_.gather(0, best[None])[0]
 
     # ---- one decoder layer
-    def layer(self, L: Inkling2Layer, h, blocks, B: Batch):
+    def _attn_input(self, L: Inkling2Layer, h, blocks, out = None):
+        """normalized attention input stream(s) [nq, T, D] bf16 (nq = 3 for global layers: q, k, v inputs)"""
         c = self.cfg
-        i, T = L.idx, h.shape[0]
-        Hl, Hkl, G = self.Hl, self.Hkl, self.G
+        i = L.idx
         nb = c.num_blocks_before(i)
-        boundary = c.is_boundary(i)
+        if L.is_global:
+            return ops.attn_res_norm(blocks, nb, h, L.attn_query, L.qkv_norms, c.eps, out = out)
+        if i == 0:
+            return ops.attn_res_norm(blocks, 0, h, torch.zeros((1, c.hidden), device = h.device), L.attn_norm, c.eps, out = out)
+        return ops.attn_res_norm(blocks, nb, h, L.attn_query[None], L.attn_norm, c.eps, out = out)
+
+    def _oproj(self, L: Inkling2Layer, o):
+        """attention output projection partial [T, D] in the all-reduce dtype"""
+        if self.skinny and o.shape[0] <= 64:
+            return skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
+        oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
+        return oa.to(self.ar_dtype) if self.ar_dtype != torch.float32 else oa
+
+    def _attention(self, L: Inkling2Layer, xs, B: Batch):
+        """projections, KV writes, attention and K/V conv-ring writes for all T rows of xs [nq, T, D]; returns o [T, Hl*128]"""
+        c = self.cfg
+        i, T = L.idx, xs.shape[1]
+        Hl, Hkl, G = self.Hl, self.Hkl, self.G
         kq, vq, ks, vs = self.kv[i]
         kring, vring, aring, mring = self.rings[i]
         bits = self.bits_g if L.is_global else self.bits_l
-        q_out = torch.empty((T, Hl, 128), dtype = torch.bfloat16, device = h.device)
-        rel_out = torch.empty((T, Hl, 16), dtype = torch.bfloat16, device = h.device)
+        dev = xs.device
+        q_out = torch.empty((T, Hl, 128), dtype = torch.bfloat16, device = dev)
+        rel_out = torch.empty((T, Hl, 16), dtype = torch.bfloat16, device = dev)
         write_ring = not B.multi
+        swa_sub = T
 
-        # attention input(s) and projections
+        # projections
         if L.is_global:
-            xs = ops.attn_res_norm(blocks, nb, h, L.attn_query, L.qkv_norms, c.eps)        # [3, T, D]
             qb = self.mm(xs[0], L.wq_cat)
             kb = self.mm(xs[1], L.wk_cat)
             vb = self.mm(xs[2], L.wv_cat)
@@ -191,22 +281,17 @@ class I2Engine:
             kraw, vraw = kb, vb
             Nq = qb
         else:
-            if i == 0:
-                x = ops.attn_res_norm(blocks, 0, h, torch.zeros((1, c.hidden), device = h.device), L.attn_norm, c.eps)
-            else:
-                x = ops.attn_res_norm(blocks, nb, h, L.attn_query[None], L.attn_norm, c.eps)
-            qb = self.mm(x[0], L.wqkv)
+            qb = self.mm(xs[0], L.wqkv)
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             koff = sink_off + Hl
             kbv, vbv = qb[:, koff:], qb[:, koff + Hkl * 128:]
-            ops.qkv_post(qb, kbv, vbv, L.kc_w, L.vc_w, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
-                         q_out, rel_out, kq, vq, ks, vs, None, c, False, bits, rel_off, 0, 0, self.ring, self.ps,
-                         write_ring, Hkl, G)
+            swa_sub = self.max_rows if (B.multi and T > self.max_rows) else T
+            if swa_sub == T:
+                ops.qkv_post(qb, kbv, vbv, L.kc_w, L.vc_w, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
+                             q_out, rel_out, kq, vq, ks, vs, None, c, False, bits, rel_off, 0, 0, self.ring, self.ps,
+                             write_ring, Hkl, G)
             kraw, vraw = kbv, vbv
             Nq = qb
-        if B.multi:
-            ops.ring_write(kraw[:, :Hkl * 128], kring, B.slot, B.pos, B.nafter)
-            ops.ring_write(vraw[:, :Hkl * 128], vring, B.slot, B.pos, B.nafter)
         gate = Nq[:, gate_off:gate_off + Hl * 128]
         sink = Nq[:, sink_off:sink_off + Hl]
         if self.rel_fused:
@@ -217,20 +302,56 @@ class I2Engine:
         else:
             R = torch.mm(rel_out.view(T * Hl, 16).float(), L.rel_proj.float()).view(T, Hl, c.rel_extent)
             relarg = None
-        o = torch.empty((T, Hl * 128), dtype = torch.bfloat16, device = h.device)
+        o = torch.empty((T, Hl * 128), dtype = torch.bfloat16, device = dev)
         nsplit = B.nsplit_g if L.is_global else B.nsplit_l
-        pm = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
-        pl = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = h.device)
-        po = torch.empty((T, Hl, nsplit, 128), dtype = torch.float32, device = h.device)
+        pm = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = dev)
+        pl = torch.empty((T, Hl, nsplit), dtype = torch.float32, device = dev)
+        po = torch.empty((T, Hl, nsplit, 128), dtype = torch.float32, device = dev)
         gq = dict(rot = self.kv_rot, ng = self.kv_ng, q16 = self.kv_q16) if L.is_global else {}
-        ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
-                      (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, rel = relarg, **gq)
-        if self.skinny and T <= 64:
-            oa = skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
+        use_pattn = (self.pattn is not None and B.multi and T >= self.pattn_min and relarg is not None
+                     and not torch.cuda.is_current_stream_capturing())
+        if (not use_pattn and L.is_global and B.multi and T >= self.attn_prefill_min and relarg is not None
+                and not torch.cuda.is_current_stream_capturing()):
+            if getattr(B, "qblocks", None) is None:
+                B.qblocks = ops.prefill_qblocks(B.nprev, B.nafter, self.attn_bq)
+            gq.update(qblocks = B.qblocks, bq = self.attn_bq)
+        if not L.is_global and swa_sub < T:
+            # SWA K/V of a multi-row call larger than the ring headroom (window + max_rows): write and attend in sub-chunks of
+            # max_rows rows, each attention before the next sub-chunk's write (that write overwrites the window entries
+            # max_rows back). In-batch conv history of a sub-chunk's first rows comes from the rows before its view.
+            for s0 in range(0, T, swa_sub):
+                r_ = slice(s0, min(T, s0 + swa_sub))
+                ops.qkv_post(qb[r_], kbv[r_], vbv[r_], L.kc_w, L.vc_w, L.q_scale, L.rel_scale, kring, vring, B.slot[r_], B.pos[r_],
+                             B.nprev[r_], q_out[r_], rel_out[r_], kq, vq, ks, vs, None, c, False, bits, rel_off, 0, 0, self.ring,
+                             self.ps, write_ring, Hkl, G)
+                if use_pattn:
+                    self.pattn.run(1, q_out[r_], rel_out[r_], L.rel_proj, sink[r_], gate[r_], kq, vq, ks, vs, None, self.ring,
+                                   B.sub_seqs(r_.start, r_.stop), o[r_])
+                else:
+                    ops.attention(q_out[r_], R[r_] if R is not None else None, sink[r_], gate[r_], kq, vq, ks, vs, None, B.slot[r_],
+                                  B.pos[r_], (pm[r_], pl[r_], po[r_]), o[r_], c, False, bits, self.ring, self.ps, nsplit, Hkl, G,
+                                  rel = (rel_out[r_], relarg[1]) if relarg is not None else None)
+        elif use_pattn:   # prefill-attn's SM120 CUDA kernel (both layer types)
+            self.pattn.run(0 if L.is_global else 1, q_out, rel_out, L.rel_proj, sink, gate, kq, vq, ks, vs,
+                           self.page_table if L.is_global else None, self.ring, B.host_seqs(), o,
+                           rot = self.kv_rot if L.is_global else None)
         else:
-            oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
-            if self.ar_dtype != torch.float32:
-                oa = oa.to(self.ar_dtype)
+            ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
+                          (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, rel = relarg, **gq)
+        if B.multi:      # conv-ring rows after every qkv_post of this call (they read the ring before the batch)
+            ops.ring_write(kraw[:, :Hkl * 128], kring, B.slot, B.pos, B.nafter)
+            ops.ring_write(vraw[:, :Hkl * 128], vring, B.slot, B.pos, B.nafter)
+        return o
+
+    def layer(self, L: Inkling2Layer, h, blocks, B: Batch):
+        c = self.cfg
+        i, T = L.idx, h.shape[0]
+        nb = c.num_blocks_before(i)
+        boundary = c.is_boundary(i)
+        kring, vring, aring, mring = self.rings[i]
+        write_ring = not B.multi
+        o = self._attention(L, self._attn_input(L, h, blocks), B)
+        oa = self._oproj(L, o)
         self.allreduce(oa)
 
         # post-attention conv + residual, attention residual for the MLP input
@@ -269,11 +390,13 @@ class I2Engine:
 
     TAP_LAYERS = (5, 11, 17, 23, 29, 35, 41)
 
-    def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False):
+    def forward(self, ids, B: Batch, stop_layer = None, taps = None, return_hidden = False, logit_rows = None):
         """ids: [T] token ids (all ranks pass the same ids). Returns this rank's logits shard [T, V/world].
         taps: optional [T, 8, D] bf16 buffer receiving the draft's target features (inputs of layers 5..41, final-norm output)"""
-        assert not (B.multi and B.single and B.T > self.max_rows), \
-            f"{B.T} rows of one sequence exceed the SWA ring headroom (max_rows {self.max_rows}): chunk the call"
+        # multi-row calls longer than max_rows run their SWA layers in sub-chunks (layer()); no row limit here
+        if (self.pc is not None and B.multi and B.single and self.pc_min <= ids.shape[0] <= self.pc_tmax and stop_layer is None
+                and hasattr(self.b12x, "run_routed") and not torch.cuda.is_current_stream_capturing()):
+            return self.forward_sharded(ids, B, taps, logit_rows, return_hidden)
         h = self.embed_tokens(ids)
         blocks = self.new_blocks(h.shape[0])
         for L in self.layers:
@@ -287,7 +410,163 @@ class I2Engine:
             taps[:, 7].copy_(x)
         if return_hidden:
             return x
+        if logit_rows is not None:      # only these rows' logits (prefill needs the last row: skips a [T, V/4] fp32 head GEMM)
+            x = x[logit_rows]
         z = torch.mm(x, self.head.unembed.t(), out_dtype = torch.float32)
+        return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
+
+
+    # ---- token-sharded prefill (prefill-comm)
+    # Layer structure after Flare's token-sharded Inkling-2 decoder (NVIDIA/hyperflare-inference, recipes/inkling2/
+    # decoder.py, Apache-2.0), adapted to EP2 x TP2 experts and to the engine's numerics: the output short-convs run on the
+    # owner's REDUCED rows (as in the all-reduce path) with 3 halo rows carried by the reduce-scatter, instead of on
+    # partial sums, so the per-rank conv rings keep holding full sums and decode is unchanged. Rank r owns rows own[r]:
+    #   1. owner: attention-residual mix + norm(s) of its rows -> slab; ring all-gather (bf16, 1 or 3 streams)
+    #   2. all rows: projections, KV / conv-ring writes, attention (TP heads), o-proj partials
+    #   3. ring reduce-scatter of the partials (owned rows + 3 halo rows); owner: post-attention conv + residual
+    #   4. owner: MLP-input mix + norm, router (top-8); ring all-gather of [fp16 rows | ids | weights]
+    #   5. all rows: this rank's EP2 x TP2 expert slice; ring reduce-scatter; owner: post-MLP conv + residual
+    # The last RC rows of every sublayer's partials are summed once at the end (one all-reduce) for the conv-ring writes.
+    def _shard_plan(self, T):
+        W = self.world
+        base, rem = divmod(T, W)
+        own, r0 = [], 0
+        for o in range(W):
+            n = base + (1 if o < rem else 0)
+            own.append((r0, n)); r0 += n
+        halo = [(max(0, a - 3), n + min(3, a)) for a, n in own]
+        return own, halo
+
+    def _layer_sh(self, L: Inkling2Layer, h, blocks, B: Batch, S, tails):
+        c = self.cfg
+        pc = self.pc
+        i, T = L.idx, B.T
+        nb = c.num_blocks_before(i)
+        boundary = c.is_boundary(i)
+        kring, vring, aring, mring = self.rings[i]
+        r0, n, hoff = S.r0, S.n, S.hoff
+        nq = 3 if L.is_global else 1
+        xb = self._pcx[nq][:, :T]
+        self._attn_input(L, h, blocks, out = xb[:, r0:r0 + n])
+        pc.all_gather(f"x{nq}", xb, S.own)
+        o = self._attention(L, xb, B)
+        pc.release(f"x{nq}")
+        oa = self._oproj(L, o)
+        tails[i, 0].copy_(oa[T - S.rc:])
+        red = pc.reduce_scatter("ra", oa, S.halo, self._pcred[0])
+        resid = torch.empty((n, c.hidden), dtype = torch.float32, device = h.device)
+        ops.sconv(red[hoff:hoff + n], L.attn_sconv, aring, S.slot, S.pos, S.nprev, 0, h = h, resid = resid, boundary = boundary,
+                  write_ring = False)
+        if boundary:
+            blocks[nb].copy_(h)
+        nb_m = nb + 1 if boundary else nb
+        xm = self._pkx[r0:r0 + n]
+        ops.attn_res_norm(blocks, nb_m, resid, L.mlp_query[None], L.mlp_norm, c.eps, out_f16 = True, out = xm[None])
+        ids_o, w_o = self.b12x.route(L.idx, xm)          # routes from the exact fp16 rows
+        self._pki[r0:r0 + n].copy_(ids_o); self._pkw[r0:r0 + n].copy_(w_o)
+        px, pi, pw = self._pkx[:T], self._pki[:T], self._pkw[:T]
+        if self.pc_pk == "fp16":
+            pc.all_gather("pk", [px, pi, pw], S.own)
+            moe = self.b12x.run_routed(L.idx, px, pi, pw, out_dtype = self.ar_dtype)
+            pc.release("pk")
+        else:
+            from .inkling2_pc import pk_quant, pk_dequant
+            fp8 = self.pc_pk == "fp8"
+            pk_quant(xm, self._pkq[r0:r0 + n], self._pks[r0:r0 + n], fp8)
+            pc.all_gather("pk", [self._pkq[:T], self._pks[:T], pi, pw], S.own)
+            pk_dequant(self._pkq[:T], self._pks[:T], px, fp8)
+            ids_a, w_a = pi.clone(), pw.clone()
+            pc.release("pk")
+            moe = self.b12x.run_routed(L.idx, px, ids_a, w_a, out_dtype = self.ar_dtype)
+        tails[i, 1].copy_(moe[T - S.rc:])
+        red = pc.reduce_scatter("rm", moe, S.halo, self._pcred[1])
+        h_new = torch.empty_like(h)
+        ops.sconv(red[hoff:hoff + n], L.mlp_sconv, mring, S.slot, S.pos, S.nprev, 1, resid = resid, out = h_new, write_ring = False)
+        return h_new
+
+    def _gather_rows(self, x_own, S, T):
+        """[n, D] bf16 owned rows -> [T, D] all rows (copy out of the slab)"""
+        xb = self._pcx[1][:, :T]
+        xb[0, S.r0:S.r0 + S.n].copy_(x_own)
+        self.pc.all_gather("x1", xb, S.own)
+        full = xb[0].clone()
+        self.pc.release("x1")
+        return full
+
+    def _draft_ctx_sharded(self, d, taps_o, taps, B, S, T):
+        """draft context of a sharded prefill: owners mix their rows (mix_rms is row-local), then gather the global
+        layer's mix of all rows and the local layers' mixes of the last min(T, RINGD) rows only; the caller's later
+        draft.store_context(taps) is skipped (ctx_stored marker). taps gets only its last row (the server's first draft)."""
+        from .inkling2_draft_ops import mix_rms
+        from .inkling2_draft import RINGD
+        D = self.cfg.hidden
+        r0, n = S.r0, S.n
+        ctx = mix_rms(taps_o, d.alpha5, d.w5)                 # [5, n, D]
+        gi = [i for i in range(5) if i not in d.LOCAL][0]
+        K = min(T, RINGD)
+        a0 = T - K
+        # global draft layer: all rows (x1 slab region, cid x1)
+        cg = self._gather_rows(ctx[gi], S, T)
+        # local draft layers: rows [a0, T) of each owner, gathered in the x3 + x1 regions viewed as [4, K, D]
+        xl = self.pc.region("dl", (4, RINGD, D), torch.bfloat16)[:, :K]
+        blk = [(max(a, a0) - a0, max(0, min(a + m, T) - max(a, a0))) for a, m in S.own]
+        b0, bn = blk[self.rank]
+        if bn > 0:
+            loc = [i for i in d.LOCAL]
+            xl[:, b0:b0 + bn].copy_(ctx[loc][:, max(r0, a0) - r0: max(r0, a0) - r0 + bn])
+        self.pc.all_gather("dl", xl, blk)
+        d.store_ctx_parts(cg, xl, B.slot, B.pos)
+        self.pc.release("dl")
+        # last row's taps (server: first draft of the sequence) from its owner
+        last = taps_o[-1].contiguous() if self.rank == self.world - 1 else torch.empty((8, D), dtype = torch.bfloat16, device = self.device)
+        dist.broadcast(last, self.world - 1)
+        taps[T - 1].copy_(last)
+        self.ctx_stored = taps
+
+    def forward_sharded(self, ids, B: Batch, taps = None, logit_rows = None, return_hidden = False):
+        from types import SimpleNamespace
+        c = self.cfg
+        T, D = ids.shape[0], c.hidden
+        own, halo = self._shard_plan(T)
+        r0, n = own[self.rank]
+        S = SimpleNamespace(own = own, halo = halo, r0 = r0, n = n, hoff = r0 - halo[self.rank][0], rc = min(ops.RC, T),
+                            slot = B.slot[r0:r0 + n], pos = B.pos[r0:r0 + n], nprev = B.nprev[r0:r0 + n])
+        # vocab-parallel embedding straight to the owned rows: reduce-scatter (exact, one nonzero term per element)
+        loc = ids - self.rank * self.embed_n
+        okm = (loc >= 0) & (loc < self.embed_n)
+        e = self.embed_w[loc.clamp(0, self.embed_n - 1)] * okm[:, None].to(self.embed_w.dtype)
+        eo = torch.empty((n, D), dtype = e.dtype, device = self.device)
+        self.pc.reduce_scatter("emb", e.contiguous(), own, eo)
+        h = ops_rms_norm(eo, self.embed.norm, c.eps)
+        blocks = self.new_blocks(n)
+        tails = torch.empty((c.layers, 2, S.rc, D), dtype = self.ar_dtype, device = self.device)
+        taps_o = torch.empty((n, 8, D), dtype = torch.bfloat16, device = self.device) if taps is not None else None
+        for L in self.layers:
+            if taps is not None and L.idx in self.TAP_LAYERS:
+                taps_o[:, self.TAP_LAYERS.index(L.idx)].copy_(h)
+            h = self._layer_sh(L, h, blocks, B, S, tails)
+        x = self.head_hidden(h, blocks)
+        xf = self._gather_rows(x, S, T)
+        if taps is not None:
+            taps_o[:, 7].copy_(x)
+            d = getattr(self, "draft_ref", None)
+            if d is not None and d.fused and __import__('os').environ.get('I2_PC_DRAFT', '1') == '1':
+                self._draft_ctx_sharded(d, taps_o, taps, B, S, T)
+            else:
+                for k in range(8):
+                    taps[:, k].copy_(self._gather_rows(taps_o[:, k].contiguous(), S, T))
+        # conv-ring rows (last RC positions of the sequence) of every sublayer: full sums of the partials
+        dist.all_reduce(tails)
+        sl, ps, na = B.slot[T - S.rc:], B.pos[T - S.rc:], B.nafter[T - S.rc:]
+        for L in self.layers:
+            kring, vring, aring, mring = self.rings[L.idx]
+            ops.ring_write(tails[L.idx, 0], aring, sl, ps, na)
+            ops.ring_write(tails[L.idx, 1], mring, sl, ps, na)
+        if return_hidden:
+            return xf
+        if logit_rows is not None:
+            xf = xf[logit_rows]
+        z = torch.mm(xf, self.head.unembed.t(), out_dtype = torch.float32)
         return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
 
 
