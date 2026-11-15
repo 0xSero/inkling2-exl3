@@ -61,7 +61,7 @@ def _cell_kernel(state_ptr, prev_ptr, w1_ptr, wr_ptr, swr, ctx_ptr, state_out_pt
 
 @triton.jit
 def _fold_kernel(latent_ptr, fw_ptr, fb_ptr, base_ptr, sbase, pv_ptr, pi_ptr, B, Vs, valid, NT,
-                 BP: tl.constexpr, BN: tl.constexpr, S: tl.constexpr):
+                 BP: tl.constexpr, BN: tl.constexpr, S: tl.constexpr, ps_ptr = None, CONF: tl.constexpr = False):
     nt = tl.program_id(0)
     offs_b = tl.arange(0, BP)
     mb = offs_b < B
@@ -81,10 +81,15 @@ def _fold_kernel(latent_ptr, fw_ptr, fb_ptr, base_ptr, sbase, pv_ptr, pi_ptr, B,
     i = tl.argmax(z, 1)
     tl.store(pv_ptr + offs_b * NT + nt, v, mask=mb)
     tl.store(pi_ptr + offs_b * NT + nt, (nt * BN + i).to(tl.int32), mask=mb)
+    if CONF:      # draft confidence: tile sum of exp(z - tile max) (softmax of the Markov-corrected logits)
+        # a tile with no valid column (padded vocab tail) has v = -inf: its sum is 0, not exp(-inf - -inf) = nan
+        e = tl.where(z > -float("inf"), tl.exp(z - v[:, None]), 0.0)
+        tl.store(ps_ptr + offs_b * NT + nt, tl.sum(e, 1), mask=mb)
 
 
 @triton.jit
-def _reduce_kernel(pv_ptr, pi_ptr, out_ptr, NT, base_idx, NTP: tl.constexpr):
+def _reduce_kernel(pv_ptr, pi_ptr, out_ptr, NT, base_idx, NTP: tl.constexpr, ps_ptr = None, CONF: tl.constexpr = False,
+                   OW: tl.constexpr = 2):
     b = tl.program_id(0)
     offs = tl.arange(0, NTP)
     m = offs < NT
@@ -93,8 +98,11 @@ def _reduce_kernel(pv_ptr, pi_ptr, out_ptr, NT, base_idx, NTP: tl.constexpr):
     best = tl.max(v, 0)
     # first (lowest) vocab index among the tile maxima
     bi = tl.min(tl.where(v == best, i, 2147483647), 0)
-    tl.store(out_ptr + b * 2, best)
-    tl.store(out_ptr + b * 2 + 1, (bi + base_idx).to(tl.float32))
+    tl.store(out_ptr + b * OW, best)
+    tl.store(out_ptr + b * OW + 1, (bi + base_idx).to(tl.float32))
+    if CONF:      # shard sum of exp(z - best) over the tile sums
+        ps = tl.load(ps_ptr + b * NT + offs, mask=m, other=0.0)
+        tl.store(out_ptr + b * OW + 2, tl.sum(tl.where(v > -float("inf"), ps * tl.exp(v - best), 0.0), 0))
 
 
 class MarkovStep:
@@ -108,6 +116,8 @@ class MarkovStep:
         self.BN = 128
         self.NT = triton.cdiv(self.Vs, self.BN)
         self.rank, self.world = eng.rank, eng.world
+        self.conf = __import__("os").environ.get("I2_DRAFT_CONF", "0") == "1"
+        self.last_conf = None          # [B] fp32 probability of the drafted token (Markov-corrected softmax) when conf is on
 
     def __call__(self, state, prev, ctx_i, base_i):
         """state [B, 256] bf16, prev [B] int64, ctx_i [B, 768] fp32, base_i [B, Vs] bf16 view (row stride arbitrary).
@@ -121,14 +131,21 @@ class MarkovStep:
                                  BP=self.BP, JT=32, BK=64, S=S, num_warps=4)
         pv = torch.empty((B, self.NT), dtype=torch.float32, device=dev)
         pi = torch.empty((B, self.NT), dtype=torch.int32, device=dev)
+        ps = torch.empty((B, self.NT), dtype=torch.float32, device=dev) if self.conf else pv
         _fold_kernel[(self.NT,)](latent, d.fold_w, d.fold_b, base_i, base_i.stride(0), pv, pi, B, self.Vs, self.valid, self.NT,
-                                 BP=self.BP, BN=self.BN, S=S, num_warps=8)
-        loc = torch.empty((B, 2), dtype=torch.float32, device=dev)
-        _reduce_kernel[(B,)](pv, pi, loc, self.NT, self.rank * self.Vs, NTP=triton.next_power_of_2(self.NT), num_warps=4)
+                                 BP=self.BP, BN=self.BN, S=S, ps_ptr=ps, CONF=self.conf, num_warps=8)
+        OW = 3 if self.conf else 2
+        loc = torch.empty((B, OW), dtype=torch.float32, device=dev)
+        _reduce_kernel[(B,)](pv, pi, loc, self.NT, self.rank * self.Vs, NTP=triton.next_power_of_2(self.NT), ps_ptr=ps,
+                             CONF=self.conf, OW=OW, num_warps=4)
         if self.world == 1:
+            if self.conf: self.last_conf = 1.0 / loc[:, 2]
             return new_state, loc[:, 1].long()
-        allv = torch.empty((self.world, B, 2), dtype=torch.float32, device=dev)
+        allv = torch.empty((self.world, B, OW), dtype=torch.float32, device=dev)
         dist.all_gather_into_tensor(allv, loc)
         best = allv[:, :, 0].argmax(0)
         tok = allv[:, :, 1].gather(0, best[None])[0].long()
+        if self.conf:      # p(drafted token) = 1 / sum_s S_s exp(M_s - M*), M* = the winning (global) max
+            M = allv[:, :, 0].max(0).values
+            self.last_conf = 1.0 / (allv[:, :, 2] * torch.exp(allv[:, :, 0] - M[None])).sum(0)
         return new_state, tok

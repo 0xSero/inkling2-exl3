@@ -149,6 +149,11 @@ class I2Engine:
             from .inkling2_pc import PcComm
             Tm, qm = self.pc_tmax, -(-self.pc_tmax // world) + 3
             slab = 4 * Tm * D * 2 + 4 * int(__import__('os').environ.get('I2_DRAFT_RINGD', 1088)) * D * 2 + Tm * D * 2 + Tm * D // 16 + Tm * 8 * 8 + 3 * 2 * (world - 1) * qm * D * 2 + (8 << 20)    # 3 reduce-scatters (ra, rm, emb)
+            # two prefill micro-batches in flight (I2_PC_MB=1): lane 1 gets its own regions for half-size chunks
+            self.pc_mb = __import__('os').environ.get('I2_PC_MB', '0') == '1'
+            Th = int(__import__('os').environ.get('I2_PC_MB_ROWS', Tm // 2))
+            if self.pc_mb:
+                slab += 5 * Th * D * 2 + Th * 8 * 8 + 3 * 2 * (world - 1) * qm * D * 2 + (8 << 20)
             self.pc = PcComm.create(rank, world, slab, rs_rows = qm)
             if self.pc is not None:       # regions in the same order on every rank (same slab offsets)
                 self._pcx = {3: self.pc.region("x3", (3, Tm, D), torch.bfloat16), 1: self.pc.region("x1", (1, Tm, D), torch.bfloat16)}
@@ -163,6 +168,23 @@ class I2Engine:
                 self._pki = self.pc.region("pki", (Tm, c.topk), torch.int32)
                 self._pkw = self.pc.region("pkw", (Tm, c.topk), torch.float32)
                 self._pcred = [torch.empty((qm, D), dtype = self.ar_dtype, device = dev) for _ in range(2)]
+                if self.pc_mb and self.pc_pk == "fp16":
+                    self.pc_th = Th
+                    self._pcx1 = {3: self.pc.region("x3_1", (3, Th, D), torch.bfloat16), 1: self.pc.region("x1_1", (1, Th, D), torch.bfloat16)}
+                    self._pkx1 = self.pc.region("pkx_1", (Th, D), torch.float16)
+                    self._pki1 = self.pc.region("pki_1", (Th, c.topk), torch.int32)
+                    self._pkw1 = self.pc.region("pkw_1", (Th, c.topk), torch.float32)
+                    self._pcred1 = [torch.empty((qm, D), dtype = self.ar_dtype, device = dev) for _ in range(2)]
+                    self._mb_streams = [torch.cuda.Stream(device = dev), torch.cuda.Stream(device = dev)]
+                    self._mb_ev = [[torch.cuda.Event() for _ in range(2)] for _ in range(c.layers)]
+                    if self.pattn is not None:
+                        self.pattn.add_lane()
+                else:
+                    self.pc_mb = False
+        # adaptive verify: optional bool [T] row mask of the current call (set by the caller around forward(); graph-safe:
+        # a persistent device tensor). Dead rows route to an expert of another EP group (skipped, weight 0): their routed
+        # experts cost no weight bytes; every other op still computes them (never accepted, KV overwritten later)
+        self.live = None
         self.b12x = None          # optional inkling2_b12x.B12xMoE (b12x fused Trellis MoE for the prepared batch sizes)
         self.moe_group = int(__import__('os').environ.get('I2_MOE_GROUP', 64))   # rows per fused coop MoE call (P0, validated on v3; 8 = old path)
 
@@ -326,7 +348,7 @@ class I2Engine:
                              self.ps, write_ring, Hkl, G)
                 if use_pattn:
                     self.pattn.run(1, q_out[r_], rel_out[r_], L.rel_proj, sink[r_], gate[r_], kq, vq, ks, vs, None, self.ring,
-                                   B.sub_seqs(r_.start, r_.stop), o[r_])
+                                   B.sub_seqs(r_.start, r_.stop), o[r_], lane = getattr(B, "lane", 0))
                 else:
                     ops.attention(q_out[r_], R[r_] if R is not None else None, sink[r_], gate[r_], kq, vq, ks, vs, None, B.slot[r_],
                                   B.pos[r_], (pm[r_], pl[r_], po[r_]), o[r_], c, False, bits, self.ring, self.ps, nsplit, Hkl, G,
@@ -334,7 +356,7 @@ class I2Engine:
         elif use_pattn:   # prefill-attn's SM120 CUDA kernel (both layer types)
             self.pattn.run(0 if L.is_global else 1, q_out, rel_out, L.rel_proj, sink, gate, kq, vq, ks, vs,
                            self.page_table if L.is_global else None, self.ring, B.host_seqs(), o,
-                           rot = self.kv_rot if L.is_global else None)
+                           rot = self.kv_rot if L.is_global else None, lane = getattr(B, "lane", 0))
         else:
             ops.attention(q_out, R, sink, gate, kq, vq, ks, vs, self.page_table if L.is_global else None, B.slot, B.pos,
                           (pm, pl, po), o, c, L.is_global, bits, self.ring, self.ps, nsplit, Hkl, G, rel = relarg, **gq)
@@ -368,7 +390,7 @@ class I2Engine:
         # routed experts (expert parallel), summed over ranks
         G = self.moe_group
         if self.b12x is not None and self.b12x.supports(T):
-            moe = self.b12x.forward(L.idx, L.mlp, xm, out_dtype = self.ar_dtype)
+            moe = self.b12x.forward(L.idx, L.mlp, xm, out_dtype = self.ar_dtype, live = self.live)
         elif G < T <= self.moe_chunk_max:
             # the fused coop kernels take up to MAX_BSZN (64) rows per call: groups of `moe_group` rows
             moe = torch.cat([L.mlp.forward(xm[s:s + G], {}).view(-1, c.hidden).clone() for s in range(0, T, G)], 0)
@@ -396,6 +418,8 @@ class I2Engine:
         # multi-row calls longer than max_rows run their SWA layers in sub-chunks (layer()); no row limit here
         if (self.pc is not None and B.multi and B.single and self.pc_min <= ids.shape[0] <= self.pc_tmax and stop_layer is None
                 and hasattr(self.b12x, "run_routed") and not torch.cuda.is_current_stream_capturing()):
+            if getattr(self, "pc_mb", False) and ids.shape[0] >= 2 * self.pc_min and ids.shape[0] // 2 <= self.pc_th:
+                return self.forward_sharded_mb(ids, B, taps, logit_rows, return_hidden)
             return self.forward_sharded(ids, B, taps, logit_rows, return_hidden)
         h = self.embed_tokens(ids)
         blocks = self.new_blocks(h.shape[0])
@@ -483,6 +507,153 @@ class I2Engine:
         h_new = torch.empty_like(h)
         ops.sconv(red[hoff:hoff + n], L.mlp_sconv, mring, S.slot, S.pos, S.nprev, 1, resid = resid, out = h_new, write_ring = False)
         return h_new
+
+    # ---- token-sharded prefill with two micro-batches in flight (I2_PC_MB=1)
+    # The chunk's rows split into lane 0 = [0, h) and lane 1 = [h, T), each sharded over the ranks as in forward_sharded and
+    # each on its own compute stream, copy stream, slab regions and kernel scratch. Lane 1 of layer L starts its attention
+    # after lane 0 of layer L wrote its K/V (pages, SWA ring, K/V conv rings): it is lane 0's continuation chunk. Lane 1's
+    # output short-convs need the 3 rows before it summed over ranks: its reduce-scatters carry lane 0's last 3 partial rows
+    # as halo rows in front (so the original in-chunk row counts apply and the conv rings are only written at the end).
+    # The copy-engine traffic of one lane then overlaps the other lane's kernels.
+    def _mb_plan(self, n_, ext, a, B):
+        from types import SimpleNamespace
+        own_l, _ = self._shard_plan(n_)
+        own = [(r + ext, m) for r, m in own_l]
+        halo = [(max(0, r - 3), m + min(3, r)) for r, m in own]
+        r0l, n = own_l[self.rank]
+        r0 = r0l + ext
+        g0 = a + r0l                                   # first owned row in chunk coordinates
+        return SimpleNamespace(own = own_l, own_x = own, halo = halo, r0 = r0l, n = n, hoff = r0 - halo[self.rank][0],
+                               rc = min(ops.RC, n_), slot = B.slot[g0:g0 + n], pos = B.pos[g0:g0 + n],
+                               nprev = B.nprev[g0:g0 + n], ext = ext)
+
+    def _layer_mb(self, L: Inkling2Layer, h, blocks, Bl, S, lane, tailbuf, tails):
+        c = self.cfg
+        pc = self.pc
+        pc.set_lane(lane)
+        i, T = L.idx, Bl.T
+        nb = c.num_blocks_before(i)
+        boundary = c.is_boundary(i)
+        kring, vring, aring, mring = self.rings[i]
+        r0, n, hoff, ext = S.r0, S.n, S.hoff, S.ext
+        sfx = "_1" if lane else ""
+        nq = 3 if L.is_global else 1
+        xb = (self._pcx1 if lane else self._pcx)[nq][:, :T]
+        self._attn_input(L, h, blocks, out = xb[:, r0:r0 + n])
+        pc.all_gather(f"x{nq}{sfx}", xb, S.own)
+        ev0, ev1 = self._mb_ev[i]
+        cur = torch.cuda.current_stream()
+        if lane:
+            cur.wait_event(ev0)                        # lane 0's K/V of this layer are written
+        o = self._attention(L, xb, Bl)
+        pc.release(f"x{nq}{sfx}")
+        oa = self._oproj(L, o)
+        if lane:
+            oa_x = torch.empty((T + ext, c.hidden), dtype = oa.dtype, device = oa.device)
+            oa_x[:ext].copy_(tailbuf[i, 0]); oa_x[ext:].copy_(oa)
+            tails[i, 0].copy_(oa[T - S.rc:])
+        else:
+            oa_x = oa
+            tailbuf[i, 0].copy_(oa[T - 3:])
+            ev0.record(cur)
+        red = pc.reduce_scatter(f"ra{sfx}", oa_x, S.halo, (self._pcred1 if lane else self._pcred)[0])
+        resid = torch.empty((n, c.hidden), dtype = torch.float32, device = h.device)
+        ops.sconv(red[hoff:hoff + n], L.attn_sconv, aring, S.slot, S.pos, S.nprev, 0, h = h, resid = resid, boundary = boundary,
+                  write_ring = False)
+        if boundary:
+            blocks[nb].copy_(h)
+        nb_m = nb + 1 if boundary else nb
+        pkx, pki, pkw = (self._pkx1, self._pki1, self._pkw1) if lane else (self._pkx, self._pki, self._pkw)
+        xm = pkx[r0:r0 + n]
+        ops.attn_res_norm(blocks, nb_m, resid, L.mlp_query[None], L.mlp_norm, c.eps, out_f16 = True, out = xm[None])
+        ids_o, w_o = self.b12x.route(L.idx, xm)
+        pki[r0:r0 + n].copy_(ids_o); pkw[r0:r0 + n].copy_(w_o)
+        px, pi, pw = pkx[:T], pki[:T], pkw[:T]
+        pc.all_gather(f"pk{sfx}", [px, pi, pw], S.own)
+        moe = self.b12x.run_routed(L.idx, px, pi, pw, out_dtype = self.ar_dtype, lane = lane)
+        pc.release(f"pk{sfx}")
+        if lane:
+            cur.wait_event(ev1)
+            moe_x = torch.empty((T + ext, c.hidden), dtype = moe.dtype, device = moe.device)
+            moe_x[:ext].copy_(tailbuf[i, 1]); moe_x[ext:].copy_(moe)
+            tails[i, 1].copy_(moe[T - S.rc:])
+        else:
+            moe_x = moe
+            tailbuf[i, 1].copy_(moe[T - 3:])
+            ev1.record(cur)
+        red = pc.reduce_scatter(f"rm{sfx}", moe_x, S.halo, (self._pcred1 if lane else self._pcred)[1])
+        h_new = torch.empty_like(h)
+        ops.sconv(red[hoff:hoff + n], L.mlp_sconv, mring, S.slot, S.pos, S.nprev, 1, resid = resid, out = h_new, write_ring = False)
+        return h_new
+
+    def forward_sharded_mb(self, ids, B: Batch, taps = None, logit_rows = None, return_hidden = False):
+        c = self.cfg
+        T, D = ids.shape[0], c.hidden
+        hT = (T // 2 + 3) // 4 * 4
+        (_, _, p0, sl0), = B.host_seqs()               # one sequence (B.single)
+        cur = torch.cuda.current_stream()
+        lanes = []
+        for li, (a, b) in enumerate(((0, hT), (hT, T))):
+            n_ = b - a
+            Bl = Batch(B.slot[a:b], B.pos[a:b], (B.nprev[a:b] - a).to(torch.int32), True, nsplit_g = B.nsplit_g, nsplit_l = B.nsplit_l)
+            Bl.seqs = [(0, n_, p0 + a, sl0)]
+            Bl.lane = li
+            S = self._mb_plan(n_, 3 if li else 0, a, B)
+            lanes.append((a, b, n_, Bl, S))
+        tailbuf = torch.empty((c.layers, 2, 3, D), dtype = self.ar_dtype, device = self.device)
+        tails = torch.empty((c.layers, 2, min(ops.RC, T - hT), D), dtype = self.ar_dtype, device = self.device)
+        st = self._mb_streams
+        hs, bls, tos = [], [], []
+        for li, (a, b, n_, Bl, S) in enumerate(lanes):
+            st[li].wait_stream(cur)
+            with torch.cuda.stream(st[li]):
+                self.pc.set_lane(li)
+                loc = ids[a:b] - self.rank * self.embed_n
+                okm = (loc >= 0) & (loc < self.embed_n)
+                e = self.embed_w[loc.clamp(0, self.embed_n - 1)] * okm[:, None].to(self.embed_w.dtype)
+                eo = torch.empty((S.n, D), dtype = e.dtype, device = self.device)
+                self.pc.reduce_scatter("emb" + ("_1" if li else ""), e.contiguous(), S.own, eo)
+                hs.append(ops_rms_norm(eo, self.embed.norm, c.eps))
+                bls.append(self.new_blocks(S.n))
+                tos.append(torch.empty((S.n, 8, D), dtype = torch.bfloat16, device = self.device) if taps is not None else None)
+        for L in self.layers:
+            for li, (a, b, n_, Bl, S) in enumerate(lanes):
+                with torch.cuda.stream(st[li]):
+                    if taps is not None and L.idx in self.TAP_LAYERS:
+                        tos[li][:, self.TAP_LAYERS.index(L.idx)].copy_(hs[li])
+                    hs[li] = self._layer_mb(L, hs[li], bls[li], Bl, S, li, tailbuf, tails)
+        xs = []
+        for li in range(2):
+            with torch.cuda.stream(st[li]):
+                xs.append(self.head_hidden(hs[li], bls[li]))
+            cur.wait_stream(st[li])
+        self.pc.set_lane(0)
+        xf = torch.cat([self._gather_rows(xs[li], lanes[li][4], lanes[li][2]) for li in range(2)], 0)
+        if taps is not None:
+            d = getattr(self, "draft_ref", None)
+            for li, (a, b, n_, Bl, S) in enumerate(lanes):
+                tos[li][:, 7].copy_(xs[li])
+                if d is not None and d.fused and __import__('os').environ.get('I2_PC_DRAFT', '1') == '1':
+                    self._draft_ctx_sharded(d, tos[li], taps[a:b], Bl, S, n_)
+                else:
+                    for k in range(8):
+                        taps[a:b, k].copy_(self._gather_rows(tos[li][:, k].contiguous(), S, n_))
+            if d is not None and d.fused and __import__('os').environ.get('I2_PC_DRAFT', '1') == '1':
+                self.ctx_stored = taps
+        # conv-ring rows (last RC positions of the chunk, all in lane 1): full sums of the partials
+        dist.all_reduce(tails)
+        rc = tails.shape[2]
+        sl, ps, na = B.slot[T - rc:], B.pos[T - rc:], B.nafter[T - rc:]
+        for L in self.layers:
+            kring, vring, aring, mring = self.rings[L.idx]
+            ops.ring_write(tails[L.idx, 0], aring, sl, ps, na)
+            ops.ring_write(tails[L.idx, 1], mring, sl, ps, na)
+        if return_hidden:
+            return xf
+        if logit_rows is not None:
+            xf = xf[logit_rows]
+        z = torch.mm(xf, self.head.unembed.t(), out_dtype = torch.float32)
+        return torch.tanh(z / self.cfg.final_cap) * self.cfg.final_cap
 
     def _gather_rows(self, x_own, S, T):
         """[n, D] bf16 owned rows -> [T, D] all rows (copy out of the slab)"""

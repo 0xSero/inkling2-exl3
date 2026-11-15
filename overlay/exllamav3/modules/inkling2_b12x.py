@@ -181,7 +181,8 @@ class B12xMoE:
     def supports(self, T):
         return T in self.sizes
 
-    def forward(self, layer_idx, mlp, x, out_dtype = torch.float32):
+    def forward(self, layer_idx, mlp, x, out_dtype = torch.float32, live = None):
+        assert live is None, "row masks need the EP2xTP2 layout (B12xMoEShard)"
         """x: [T, H] fp16 (the MoE input). Returns [T, H] routed sum over this rank's experts (kernel output fp16)"""
         T = x.shape[0]
         buf, launch, tsum, tkey = self.sizes[T]
@@ -318,7 +319,7 @@ class B12xMoEShard:
         # prefill sizes (eager, never two at once on the stream) share one set of scratch buffers: each field is a prefix
         # view of the largest size's field. Separate buffers for 64..4096 cost ~3 GB/GPU of KV pages (I2_B12X_SHARE_BUF=0: off).
         share = os.environ.get("I2_B12X_SHARE_BUF", "1") == "1"
-        share_min = int(os.environ.get("I2_B12X_SHARE_MIN", 256))
+        share_min = int(os.environ.get("I2_B12X_SHARE_MIN", 1))     # every size: decode verify sizes too (adaptive verify adds ~15)
         big = None
         for T in sorted(set(sizes) | set(self.PREFILL_SIZES), reverse = True):
             tile_T = self.tiles[T]
@@ -341,6 +342,23 @@ class B12xMoEShard:
             tsum = self.compile_sum(m = T, topk = self.topk, hidden_size = H, element_dtype = "fp16", full_rotation = True,
                                     num_experts = Eg, route_num_experts = E_all, route_ids_dtype = torch.int32, use_expert_map = True)
             self.sizes[T] = (buf, launch, tsum, (tile_T[1], tile_T[3]), bm)
+        # lane 1 (token-sharded prefill with two micro-batches in flight, I2_PC_MB=1): its own scratch buffers (one shared set
+        # for the prefill sizes up to I2_PC_MB_ROWS) and its own launch workspace (tile-scheduler counters)
+        self.lane1 = {}
+        self._ws1 = None
+        self._tier1 = {}
+        if os.environ.get("I2_PC_MB", "0") == "1":
+            from b12x.moe._shared.kernels.w4a16.prepare import _make_workspace
+            self._ws1 = _make_workspace(dev, max_blocks_per_sm = 4)
+            mbr = int(os.environ.get("I2_PC_MB_ROWS", 2048))
+            big1 = None
+            for T in sorted((t for t in self.sizes if share_min <= t <= mbr), reverse = True):
+                buf0, launch, tsum, tkey, bm = self.sizes[T]
+                buf = self.make_buffers(lay0.tier_for(self.tiles[T]), m = T, topk = self.topk, dtype = torch.float16, device = dev,
+                                        route_num_experts = E_all, full_rotation = True, block_size_m = bm)
+                if big1 is None: big1 = buf
+                else: buf = _share_prefix(buf, big1)
+                self.lane1[T] = buf
         if share:
             torch.cuda.empty_cache()      # the replaced per-size buffers go back to the device (KV sizing reads free memory)
         self.record = None
@@ -367,16 +385,27 @@ class B12xMoEShard:
             return route_sigmoid_topk_tiled(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale)
         return _route_large(x, self.router_w[layer_idx], self.router_b[layer_idx], self.topk, self.route_scale)
 
-    def forward(self, layer_idx, mlp, x, out_dtype = torch.float32):
+    def forward(self, layer_idx, mlp, x, out_dtype = torch.float32, live = None):
+        """live: optional bool [T]; dead rows route to this layer's pad expert (another group: -1 here) with weight 0"""
         ids, w = self.route(layer_idx, x)
+        if live is not None and live.shape[0] == x.shape[0]:
+            ids = torch.where(live[:, None], ids, torch.full_like(ids, self.pad_experts[layer_idx]))
+            w = w * live[:, None].to(w.dtype)
         return self.run_routed(layer_idx, x, ids, w, out_dtype)
 
-    def run_routed(self, layer_idx, x, ids, w, out_dtype = torch.float32):
+    def run_routed(self, layer_idx, x, ids, w, out_dtype = torch.float32, lane = 0):
         """routed-expert sum of this rank's slice for rows x [T, H] fp16 with given routes (ids int32, w fp32 [T, k])"""
         T = x.shape[0]
         S = next(s for s in sorted(self.sizes) if s >= T)
         buf, launch, tsum, tkey, bm = self.sizes[S]
         tier = self.layers[layer_idx].tiers[tkey]
+        if lane:
+            import dataclasses
+            buf = self.lane1[S]
+            k1 = (layer_idx, tkey)
+            if k1 not in self._tier1:
+                self._tier1[k1] = dataclasses.replace(tier, workspace = self._ws1)
+            tier = self._tier1[k1]
         if self.record is not None:
             self.record.append((layer_idx, ids.long().clone()))
         if S != T:

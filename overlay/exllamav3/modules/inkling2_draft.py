@@ -387,9 +387,13 @@ class I2Draft:
             ms = self._mstep.get(B)
             if ms is None:
                 ms = self._mstep[B] = MarkovStep(self, B)
+            confs = []
             for i in range(K):
                 state, prev = ms(state, prev, ctx[i], base[:, i])
                 out.append(prev)
+                if ms.conf: confs.append(ms.last_conf)
+            # draft confidences [B, K] (probability of each drafted token under the Markov-corrected draft softmax)
+            self.last_conf = torch.stack(confs, 1) if confs else None
             return torch.stack(out, 1)
         r = lambda t: t.bfloat16().float()
         for i in range(K):

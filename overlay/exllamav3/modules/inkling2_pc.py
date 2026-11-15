@@ -67,7 +67,15 @@ class PcComm:
         self.cs = torch.cuda.Stream(device = self.dev)          # copy stream (CE work + flag writes/waits)
         self.cs3 = [torch.cuda.Stream(device = self.dev) for _ in range(world - 1)]     # one per peer (all-to-all)
         self.ev = [torch.cuda.Event() for _ in range(8)]
+        # lanes (two prefill micro-batches in flight, I2_PC_MB): each lane has its own copy stream and events; collectives
+        # of different lanes use different names (cids / slab regions), so they never wait on each other
+        self._lanes = [(self.cs, self.ev), (torch.cuda.Stream(device = self.dev), [torch.cuda.Event() for _ in range(8)])]
+        self.lane = 0
         self.nxt, self.prv = (rank + 1) % world, (rank - 1) % world
+
+    def set_lane(self, k):
+        self.lane = k
+        self.cs, self.ev = self._lanes[k]
 
     @classmethod
     def create(cls, rank, world, slab_bytes, max_cids = 64, rs_rows = 0):

@@ -94,12 +94,16 @@ class PrefillAttn:
         self._plan_cache[key] = p
         return p
 
-    def run(self, kind, q, rel_q, rel_proj, sink, gate, kq, vq, ks, vs, page_table, ring, seqs, out, rot = None):
+    def add_lane(self):
+        self.part_o1 = torch.empty_like(self.part_o)
+        self.part_ml1 = torch.empty_like(self.part_ml)
+
+    def run(self, kind, q, rel_q, rel_proj, sink, gate, kq, vq, ks, vs, page_table, ring, seqs, out, rot = None, lane = 0):
         hkl = kq.shape[-2]
         ut, ct, nu, seg, total, ncta = self.plan(kind, seqs, hkl)
         if kind == 1:
             assert ring % BN == 0
         self.ext.pattn(kind, q, rel_q, self.relpT(rel_proj), sink, gate, kq, vq, ks, vs,
                        page_table if page_table is not None else self._dummy, ring,
-                       self.rot(rot) if rot is not None else self._dummy, ut, ct, nu, seg, total, ncta, out, self.part_o, self.part_ml)
+                       self.rot(rot) if rot is not None else self._dummy, ut, ct, nu, seg, total, ncta, out, *((self.part_o1, self.part_ml1) if lane else (self.part_o, self.part_ml)))
         return out

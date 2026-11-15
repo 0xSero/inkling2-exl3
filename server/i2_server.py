@@ -21,7 +21,7 @@ ap.add_argument("--port", type=int, default=8000)
 ap.add_argument("--host", default="0.0.0.0")
 ap.add_argument("--slots", type=int, default=16)
 ap.add_argument("--kv-gb", type=float, default=0.0, help="KV cache budget per GPU for global-layer pages (0 = auto from free memory)")
-ap.add_argument("--reserve-gb", type=float, default=1.75, help="free memory kept for workspace when sizing KV automatically (4096-row sharded prefill keeps ~2.5 GiB headroom unused at 1.75; 16x380K needs <= 1.9)")
+ap.add_argument("--reserve-gb", type=float, default=2.75, help="free memory kept for workspace when sizing KV automatically (4096-row sharded prefill keeps ~2.5 GiB headroom unused at 1.75; 16x380K needs <= 1.9)")
 ap.add_argument("--max-model-len", type=int, default=380000)
 ap.add_argument("--bits-g", type=int, default=4); ap.add_argument("--bits-l", type=int, default=8)
 ap.add_argument("--burst", type=int, default=1, help="max back-to-back speculative steps per scheduler round (1 = one host sync per step)")
@@ -40,10 +40,18 @@ ap.add_argument("--reuse", type=int, default=0, help="session reuse: a new reque
 ap.add_argument("--reuse-min", type=int, default=1024, help="minimum reused prefix (tokens)")
 ap.add_argument("--max-step-rows", type=int, default=512, help="rows per mixed (decode + prefill) forward: keeps the decoding users' step near a 512-row chunk")
 ap.add_argument("--served-name", default="inkling-2-small")
+ap.add_argument("--adaptive", type=int, default=1, help="adaptive verification: every round drafts the full 7-token block; inside the graph each request verifies the live width (rows incl. anchor) with the most expected tokens per ms (calibrated draft confidence x measured round cost, shared row budget); one graph per (bucket, physical width)")
+ap.add_argument("--av-widths", default="1:2,3,4,5,6,8;2:2,3,4,5,6,8;4:2,3,4,5,6,8;8:2,3,4,6,8;16:2,3,4,6,8", help="captured physical verify widths per bucket (adaptive)")
+ap.add_argument("--av-calib", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/av_calib.json"), help="confidence -> prefix-acceptance table (serving/av_fit.py)")
+ap.add_argument("--av-cost", default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "data/av_cost.json"), help="measured round ms per (B, physical width, live width) (serving/av_offline.py --mode cost)")
+ap.add_argument("--av-host-ms", type=float, default=0.8, help="host time per decode round added to the graph cost (server loop overhead)")
+ap.add_argument("--av-fixed", type=int, default=0, help="diagnostics: every request verifies this live width (1..8) instead of the policy")
 ap.add_argument("--b12x", type=int, default=int(os.environ.get("I2_B12X", "0")), help="routed experts of the speculative verify through the b12x fused Trellis MoE (needs the b12x stack: cutlass-dsl + FlashInfer tree at I2_B12X_PATH)")
 args = ap.parse_args()
 if args.b12x:
     os.environ["EXL3_LOAD_ARENA"] = "0"     # b12x repack frees the per-expert tensors; arena slabs would pin a second copy
+if args.adaptive:
+    os.environ["I2_DRAFT_CONF"] = "1"     # the width policy reads the Markov step's draft confidences
 SPEC = True               # speculative decoding is always on (every batch size); there is no plain-decode path
 _SK = {int(k): int(v) for k, v in (x.split(":") for x in args.spec_k.split(","))} if ":" in args.spec_k else None
 def spec_k(B):
@@ -51,6 +59,12 @@ def spec_k(B):
     if _SK is None: return int(args.spec_k)
     ks = sorted(_SK)
     return _SK[next((k for k in ks if k >= B), ks[-1])]
+_AVW = {int(b): [int(x) for x in ws.split(",")] for b, ws in (p.split(":") for p in args.av_widths.split(";"))}
+def widths(B):
+    """physical verify widths (rows per request) with captured graphs for decode bucket B"""
+    if not args.adaptive: return [spec_k(B) + 1]
+    ks = sorted(_AVW); return _AVW[next((k for k in ks if k >= B), ks[-1])]
+DRAFT_K = lambda K: 7 if args.adaptive else K
 rank, world = int(os.environ["RANK"]), int(os.environ["WORLD_SIZE"])
 torch.cuda.set_device(rank); dev = torch.device(f"cuda:{rank}")
 dist.init_process_group("nccl", device_id=dev)
@@ -91,7 +105,8 @@ SNAP = {i: tuple(torch.zeros_like(r) for r in rs) for i, rs in eng.rings.items()
 if args.b12x:
     from exllamav3.modules.inkling2_b12x import B12xMoE
     tb = time.time()
-    attach_moe(eng, model, args.model, cfg, dev, rank, world, sizes=sorted(set((spec_k(b) + 1) * b for b in (1, 2, 4, 8, 16) if b <= S)))
+    _vt = sorted(set(w * b for b in (1, 2, 4, 8, 16) if b <= S for w in widths(b)) | ({8} if args.adaptive else set()))
+    attach_moe(eng, model, args.model, cfg, dev, rank, world, sizes=_vt)
     log(f"b12x fused Trellis MoE attached for verify T={sorted(eng.b12x.sizes)} in {time.time()-tb:.0f}s (tile {eng.b12x.tile})")
 free1, _ = torch.cuda.mem_get_info()
 budget = args.kv_gb * 2**30 if args.kv_gb > 0 else max(0.0, free1 - args.reserve_gb * 2**30)
@@ -115,13 +130,21 @@ log(f"KV pages: {NP} x {PS} = {NP*PS:,} tokens (per GPU {NP*page_bytes()/2**30:.
 BUCKETS = [b for b in (1, 2, 4, 8, 16) if b <= S]
 DUMMY = NS                              # scratch slot for padded rows; owns page 0
 PROF_AT = int(os.environ.get("I2_PROFILE_AT", "0")); PROF_STEP = 0
-BURST_EMIT = torch.zeros((max(1, args.burst), S + 1, 8), dtype=torch.long, device=dev)
-BURST_N = torch.zeros((max(1, args.burst), S + 1), dtype=torch.long, device=dev)
+# per burst step, per bucket row: [emit 0..7 | n | live width w | next-round width index (same in every row)]
+BURST_OUT = torch.zeros((max(1, args.burst), S + 1, 11), dtype=torch.long, device=dev)
 anchor_all = torch.zeros(NS + 1, dtype=torch.long, device=dev)
 d_all = torch.zeros((NS + 1, 7), dtype=torch.long, device=dev)
 P_all = torch.zeros(NS + 1, dtype=torch.int32, device=dev)
 temp_all = torch.zeros(NS + 1, dtype=torch.float32, device=dev)
+conf_all = torch.ones((NS + 1, 7), dtype=torch.float32, device=dev)      # draft confidences of d_all (adaptive)
 eng.page_table[DUMMY, :2] = 0
+ar7 = torch.arange(7, device=dev)
+POL = None
+if args.adaptive:
+    from exllamav3.modules.inkling2_av import AVPolicy
+    POL = AVPolicy.from_files(args.av_calib, args.av_cost, dev, {B: widths(B) for B in (1, 2, 4, 8, 16) if B <= S},
+                              host_ms=args.av_host_ms)
+    if args.av_fixed: POL.fixed = args.av_fixed
 EOS = 200006
 V = cfg.i2.unpadded_vocab
 ar8 = torch.arange(8, dtype=torch.int32, device=dev)
@@ -136,57 +159,65 @@ def sample_rows(z, temps):
     return eng.global_argmax(z)
 
 class Bucket:
-    def __init__(self, B, spec):
+    """one captured speculative round for decode bucket B at physical verify width W (rows per request, incl. anchor)"""
+    def __init__(self, B, spec, W=None):
         self.B = B
         self.spec = spec and SPEC
-        self.K = spec_k(B)
-        R = self.K + 1
+        self.W = (spec_k(B) + 1) if W is None else W
+        R = self.W
         self.slots = torch.full((B,), DUMMY, dtype=torch.int32, device=dev)
-        self.emit = torch.zeros((B, R), dtype=torch.long, device=dev)
-        self.n = torch.zeros(B, dtype=torch.long, device=dev)
+        self.out = torch.zeros((B, 11), dtype=torch.long, device=dev)
         self.taps = torch.empty((B * R if self.spec else B, 8, 4608), dtype=torch.bfloat16, device=dev) if SPEC else None
         self.graph = None
 
     @torch.no_grad()
     def step(self):
-        B, K = self.B, self.K
-        R = K + 1
+        B, R = self.B, self.W
+        K = R - 1
         arR = ar8[:R]
         sl = self.slots.long()
+        real = self.slots != DUMMY
         slot8 = self.slots.repeat_interleave(R)
         nprev = arR.repeat(B); nafter = (K - nprev).to(torch.int32)
         P = P_all[sl]
         anchor = anchor_all[sl]
-        temps = temp_all[sl].repeat_interleave(R)
+        tb = temp_all[sl]
+        temps = tb.repeat_interleave(R)
         pos = (P[:, None] + arR[None]).reshape(-1).to(torch.int32)
         nsplit_g = args.nsplit_g
-        if self.spec:
-            d = d_all[sl][:, :K]
-            ids = torch.cat([anchor[:, None], d], 1).reshape(-1)
-            bt = Batch(slot8, pos, nprev, True, nsplit_g=nsplit_g, nsplit_l=4, nafter=nafter)
-            z = eng.forward(ids, bt, taps=self.taps)
-            g = sample_rows(z, temps).view(B, R)
-            n = (d == g[:, :K]).int().cumprod(1).sum(1)
-            draft.store_context(self.taps, slot8, pos)
-            newanchor = g.gather(1, n[:, None])[:, 0]
-            emit = torch.cat([d, g[:, :1]], 1)
-            emit.scatter_(1, n[:, None], newanchor[:, None])
-            self.emit.copy_(emit); self.n.copy_(n)
-            Pn = P + (n + 1).to(torch.int32)
-            f_last = self.taps.view(B, R, 8, 4608)[torch.arange(B, device=dev), n]
-            dn = draft.draft(newanchor, self.slots, Pn, f_last, nsplit_g=nsplit_g, K=K)
-            anchor_all[sl] = newanchor; P_all[sl] = Pn; d_all[sl, :K] = dn
+        d = d_all[sl][:, :K]
+        if POL is not None:
+            # live width per request from the calibrated confidences of its drafts (shared row budget); dead rows skip
+            # their routed experts, dummy-slot rows are all dead
+            ctx = POL.mean_ctx(P, real)
+            w = POL.choose(conf_all[sl], tb, real, B, R, ctx=ctx)
+            live = ((arR[None].long() < w[:, None]) & real[:, None]).reshape(-1)
         else:
-            bt = Batch(self.slots, P, torch.zeros(B, dtype=torch.int32, device=dev), False, nsplit_g=nsplit_g, nsplit_l=4)
-            z = eng.forward(anchor, bt, taps=self.taps)
-            if SPEC:       # keep the draft's context K/V complete so speculative steps can resume at any time
-                draft.store_context(self.taps, self.slots, P)
-            tok = sample_rows(z, temp_all[sl])
-            self.emit[:, 0] = tok; self.n.zero_()
-            anchor_all[sl] = tok; P_all[sl] = P + 1
+            w = torch.full((B,), R, dtype=torch.long, device=dev)
+            live = None
+        ids = torch.cat([anchor[:, None], d], 1).reshape(-1)
+        bt = Batch(slot8, pos, nprev, True, nsplit_g=nsplit_g, nsplit_l=4, nafter=nafter)
+        eng.live = live
+        z = eng.forward(ids, bt, taps=self.taps)
+        eng.live = None
+        g = sample_rows(z, temps).view(B, R)
+        n = ((d == g[:, :K]) & (ar7[None, :K] < (w - 1)[:, None])).int().cumprod(1).sum(1)
+        draft.store_context(self.taps, slot8, pos)
+        newanchor = g.gather(1, n[:, None])[:, 0]
+        emit = torch.cat([d, g[:, :1]], 1)
+        emit.scatter_(1, n[:, None], newanchor[:, None])
+        Pn = P + (n + 1).to(torch.int32)
+        f_last = self.taps.view(B, R, 8, 4608)[torch.arange(B, device=dev), n]
+        KD = DRAFT_K(K)
+        dn = draft.draft(newanchor, self.slots, Pn, f_last, nsplit_g=nsplit_g, K=KD)
+        anchor_all[sl] = newanchor; P_all[sl] = Pn; d_all[sl, :KD] = dn
+        self.out[:, :R].copy_(emit); self.out[:, 8].copy_(n); self.out[:, 9].copy_(w)
+        if POL is not None:
+            conf_all[sl] = draft.last_conf
+            self.out[:, 10].copy_(POL.best_width(draft.last_conf, tb, real, B, ctx=POL.mean_ctx(Pn, real)).expand(B))
 
 buckets = {}                                        # no plain-decode graphs: every decode step is speculative
-sbuckets = {B: Bucket(B, True) for B in BUCKETS}
+sbuckets = {(B, W): Bucket(B, True, W) for B in BUCKETS for W in widths(B)}
 pool = None
 def capture(b):
     global pool
@@ -199,13 +230,13 @@ def capture(b):
         b.step()
     pool = g.pool()
     b.graph = g
-    anchor_all.zero_(); P_all.zero_(); d_all.zero_()
+    anchor_all.zero_(); P_all.zero_(); d_all.zero_(); conf_all.fill_(1.0)
 
 t0 = time.time()
 with torch.no_grad():
     for B in sbuckets:
         capture(sbuckets[B])
-log(f"speculative graphs captured for buckets {BUCKETS} (draft K {[spec_k(b) for b in BUCKETS]}) in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
+log(f"speculative graphs captured for (bucket, width) {sorted(sbuckets)} (draft depth {DRAFT_K(0) if args.adaptive else 'K'}) in {time.time()-t0:.0f}s; GPU free {torch.cuda.mem_get_info()[0]/2**30:.1f} GiB")
 
 # ---------------------------------------------------------------------------------------------------------- commands
 OP_NOOP, OP_PREFILL, OP_DECODE, OP_PAGES, OP_MIXED, OP_SNAP, OP_RESTORE, OP_STOP = 0, 1, 2, 3, 4, 5, 6, 9
@@ -250,6 +281,7 @@ def do_prefill(h, pay, fpay):
         if SPEC:
             sl = torch.tensor([slot], dtype=torch.int32, device=dev)
             d_all[slot] = draft.draft(tok, sl, P_all[slot:slot + 1], taps[-1:], nsplit_g=8)[0]
+            if POL is not None: conf_all[slot] = draft.last_conf[0]
         return int(tok[0]) if rank == 0 else None
     return None
 
@@ -257,11 +289,10 @@ def do_prefill(h, pay, fpay):
 def do_decode(h, pay, fpay):
     """h[4] = number of back-to-back speculative steps (burst; one host sync for all of them)"""
     B, nact, nsteps = h[1], h[2], max(1, h[4])
-    b = sbuckets[B] if h[3] else buckets[B]
+    b = sbuckets[(B, h[5] or widths(B)[-1])]
     sl = pay[:nact].to(torch.int32)
     b.slots.fill_(DUMMY); b.slots[:nact] = sl
     P_all[DUMMY] = 0
-    R = b.emit.shape[1]
     global PROF_STEP
     PROF_STEP += nsteps
     if PROF_AT and PROF_AT <= PROF_STEP < PROF_AT + nsteps:
@@ -279,9 +310,9 @@ def do_decode(h, pay, fpay):
     for i in range(nsteps):
         b.graph.replay()
         if rank == 0:
-            BURST_EMIT[i, :B, :R].copy_(b.emit); BURST_N[i, :B].copy_(b.n)
+            BURST_OUT[i, :B].copy_(b.out)
     if rank == 0:
-        return BURST_EMIT[:nsteps, :B, :R].cpu(), BURST_N[:nsteps, :B].cpu()
+        return BURST_OUT[:nsteps, :B].cpu()
     return None
 
 @torch.no_grad()
@@ -311,9 +342,15 @@ def do_mixed(h, pay, fpay):
     i32 = lambda t: t.to(torch.int32)
     parts = []                                     # (ids, slot, pos, nprev, nafter) per block of rows
     if nact:
-        K = spec_k(next(b for b in BUCKETS if b >= nact)); R = K + 1; arR = ar8[:R]
+        Bm = next(b for b in BUCKETS if b >= nact)
+        R = h[4] or widths(Bm)[-1]; K = R - 1; arR = ar8[:R]
         sl = torch.tensor(dslots, dtype=torch.int32, device=dev); sll = sl.long()
         P = P_all[sll]; d = d_all[sll][:, :K]
+        if POL is not None:
+            _real = torch.ones(nact, dtype=torch.bool, device=dev)
+            wv = POL.choose(conf_all[sll], temp_all[sll], _real, nact, R, cost_B=Bm, ctx=POL.mean_ctx(P, _real))
+        else:
+            wv = torch.full((nact,), R, dtype=torch.long, device=dev)
         nprev = arR.repeat(nact)
         parts.append((torch.cat([anchor_all[sll][:, None], d], 1).reshape(-1), sl.repeat_interleave(R),
                       i32((P[:, None] + arR[None]).reshape(-1)), nprev, i32(K - nprev)))
@@ -333,12 +370,15 @@ def do_mixed(h, pay, fpay):
     for slot, start, n, last in segs:
         r_ += n
         if last: last_rows[slot] = len(lr); lr.append(r_ - 1)
+    if POL is not None and nact:
+        eng.live = torch.cat([(arR[None].long() < wv[:, None]).reshape(-1), torch.ones(T - nact * R, dtype=torch.bool, device=dev)])
     z = eng.forward(ids, bt, taps=taps, logit_rows=torch.tensor(lr, dtype=torch.long, device=dev)) if lr else None
     if z is None:
         eng.forward(ids, bt, taps=taps, return_hidden=True)
+    eng.live = None
     if nact:
         g = sample_rows(z[:nact * R], temp_all[sll].repeat_interleave(R)).view(nact, R)
-        nacc = (d == g[:, :K]).int().cumprod(1).sum(1)
+        nacc = ((d == g[:, :K]) & (ar7[None, :K] < (wv - 1)[:, None])).int().cumprod(1).sum(1)
     draft.store_context(taps, slot_r, pos_r)
     emit_n = None
     if nact:
@@ -347,9 +387,11 @@ def do_mixed(h, pay, fpay):
         emit.scatter_(1, nacc[:, None], newanchor[:, None])
         Pn = P + (nacc + 1).to(torch.int32)
         f_last = taps[:nact * R].view(nact, R, 8, 4608)[torch.arange(nact, device=dev), nacc]
-        dn = draft.draft(newanchor, sl, Pn, f_last, nsplit_g=8, K=K)
-        anchor_all[sll] = newanchor; P_all[sll] = Pn; d_all[sll, :K] = dn
-        emit_n = (emit, nacc)
+        KD = DRAFT_K(K)
+        dn = draft.draft(newanchor, sl, Pn, f_last, nsplit_g=8, K=KD)
+        anchor_all[sll] = newanchor; P_all[sll] = Pn; d_all[sll, :KD] = dn
+        if POL is not None: conf_all[sll] = draft.last_conf
+        emit_n = (emit, nacc, wv)
     first = {}
     row = nact * R if nact else 0
     for i, (slot, start, n, last) in enumerate(segs):
@@ -361,9 +403,10 @@ def do_mixed(h, pay, fpay):
             anchor_all[slot] = tk[0]; P_all[slot] = start + n
             sl1 = torch.tensor([slot], dtype=torch.int32, device=dev)
             d_all[slot] = draft.draft(tk, sl1, P_all[slot:slot + 1], taps[row - 1:row], nsplit_g=8)[0]
+            if POL is not None: conf_all[slot] = draft.last_conf[0]
             first[slot] = tk
     if rank == 0:
-        return ((emit_n[0].cpu(), emit_n[1].cpu()) if emit_n else (None, None)), {k: int(v[0]) for k, v in first.items()}
+        return ((emit_n[0].cpu(), emit_n[1].cpu(), emit_n[2].cpu()) if emit_n else (None, None, None)), {k: int(v[0]) for k, v in first.items()}
     return None
 
 def worker_loop():
@@ -407,7 +450,26 @@ free_pages = list(range(1, NP))       # page 0 belongs to the dummy slot
 active = {}                           # slot -> Req
 prefilling = []                       # Reqs with remaining prompt
 loop_ref = {}
-STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0, 'stall_time': 0.0, 'tool_ok': 0, 'tool_bad': 0, 'mix_steps': 0, 'mix_time': 0.0, 'mix_pre_tok': 0, 'mix_rows': 0, 'mix_tok': 0, 'mix_dsteps': 0, 'aborted': 0, 'pre_cached_tok': 0, 'reuse_a': 0, 'reuse_b': 0, 'reuse_evict': 0}
+STATS = {'dec_steps': 0, 'dec_time': 0.0, 'dec_rows': 0, 'dec_tok': 0, 'pre_time': 0.0, 'pre_tok': 0, 'idle_time': 0.0, 'stall_time': 0.0, 'tool_ok': 0, 'tool_bad': 0, 'mix_steps': 0, 'mix_time': 0.0, 'mix_pre_tok': 0, 'mix_rows': 0, 'mix_tok': 0, 'mix_dsteps': 0, 'aborted': 0, 'pre_cached_tok': 0, 'reuse_a': 0, 'reuse_b': 0, 'reuse_evict': 0, 'dec_vrows': 0, 'dec_prows': 0}
+
+class WidthChooser:
+    """rank 0: physical verify width of the next decode graph. The graph itself reports, after drafting, which captured
+    width has the most expected tokens per ms for its slot set's new drafts; that report is used when the next round has
+    the same slot set, else the bucket's last choice (the widest width before any report)"""
+    def __init__(self):
+        self.prev = None; self.last = {}; self.chosen = collections.Counter(); self.live = collections.Counter()
+    def choose(self, B, slots):
+        ws = widths(B)
+        if self.prev is not None and self.prev[0] == (B, tuple(slots)):
+            W = ws[self.prev[1]]
+        else:
+            W = self.last.get(B, ws[-1])
+        self.chosen[(B, W)] += 1
+        return W
+    def update(self, B, slots, W, wi_next, wlive):
+        self.prev = ((B, tuple(slots)), int(wi_next)); self.last[B] = widths(B)[int(wi_next)]
+        for x in wlive: self.live[int(x)] += 1
+CHOOSER = WidthChooser() if args.adaptive else None
 
 class Req:
     def __init__(self, ids, max_tokens, temperature, out_q):
@@ -533,18 +595,22 @@ def scheduler():
             slots = sorted(active)
             nb = len(slots)
             use_spec = True
-            B = next(b for b in (sbuckets if use_spec else buckets) if b >= nb)
+            B = next(b for b in BUCKETS if b >= nb)
+            W = CHOOSER.choose(B, slots) if CHOOSER else spec_k(B) + 1
             # burst of back-to-back steps when nothing waits for admission/prefill; bounded by every active request's
             # page headroom (24 positions past max_tokens) so overshooting steps never write outside its pages
-            R = spec_k(B) + 1
+            R = W
             nsteps = 1
             if not prefilling and (pending.empty() or not free_slots) and args.burst > 1:
                 head = min((r.max_tokens + 24 - R - len(r.gen)) // R for r in active.values())
                 nsteps = max(1, min(args.burst, head))
-            h = [OP_DECODE, B, nb, int(use_spec), nsteps, 0, nb, 0]
+            h = [OP_DECODE, B, nb, int(use_spec), nsteps, W, nb, 0]
             td0 = time.time()
             bcast(h, slots)
-            emit_t, n_t = do_decode(HDR.tolist(), PAY[:nb], None)
+            out_t = do_decode(HDR.tolist(), PAY[:nb], None)
+            emit_t, n_t, w_t = out_t[:, :, :8], out_t[:, :, 8], out_t[:, :, 9]
+            if CHOOSER: CHOOSER.update(B, slots, W, out_t[-1, 0, 10], w_t[-1, :nb].tolist())
+            STATS['dec_vrows'] += int(w_t[:, :nb].sum()); STATS['dec_prows'] += B * W * nsteps
             STATS['dec_steps'] += nsteps; STATS['dec_time'] += time.time() - td0; STATS['dec_rows'] += nb * nsteps
             STATS['dec_tok'] += int(n_t[:, :nb].sum()) + nb * nsteps
             for st in range(nsteps):
@@ -567,7 +633,9 @@ def mixed_round():
         return
     slots = sorted(active)
     nact = len(slots)
-    R = spec_k(next(b for b in BUCKETS if b >= nact)) + 1 if nact else 0
+    Bm = next(b for b in BUCKETS if b >= nact) if nact else 0
+    Km = (widths(Bm)[-1] if CHOOSER else spec_k(Bm) + 1) if nact else 0       # physical rows per decoding slot
+    R = Km
     left = min(args.prefill_budget, args.max_step_rows - nact * R) if nact else args.chunk
     segs = []
     for req in prefilling:
@@ -577,10 +645,10 @@ def mixed_round():
         left -= n
     ids = [t for req, st, n, _ in segs for t in req.ids[st:st + n]]
     pay = slots + [x for req, st, n, last in segs for x in (req.slot, st, n, int(last))] + ids
-    h = [OP_MIXED, nact, len(segs), len(ids), 0, 0, len(pay), len(segs)]
+    h = [OP_MIXED, nact, len(segs), len(ids), Km, 0, len(pay), len(segs)]
     t0 = time.time()
     bcast(h, pay, [req.temperature for req, _, _, _ in segs])
-    (emit_t, n_t), first = do_mixed(HDR.tolist(), PAY[:len(pay)], FPAY[:len(segs)])
+    (emit_t, n_t, _w), first = do_mixed(HDR.tolist(), PAY[:len(pay)], FPAY[:len(segs)])
     dt = time.time() - t0
     STATS['mix_steps'] += 1; STATS['mix_time'] += dt; STATS['mix_pre_tok'] += len(ids)
     STATS['mix_rows'] += nact; STATS['mix_tok'] += (int(n_t.sum()) + nact) if nact else 0
