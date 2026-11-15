@@ -26,9 +26,9 @@ docker run --rm --gpus all -e CUDA_VISIBLE_DEVICES= ghcr.io/0xsero/inkling2-exl3
 
 The first run downloads the model (~313 GB, resumable) into `$HOME/models/Inkling-2-Small-EXL3-4bpw`.
 - `sweep` prints a markdown table (median of 3 repeats) and writes JSON to `/models/results/`.
-- `serve` exposes `/v1/chat/completions`, `/v1/completions`, `/v1/models` and `/health`. `/health` also reports the KV token capacity (`kv_tokens`).
+- `serve` exposes `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize` and `/health`. `/health` also reports the KV token capacity (`kv_tokens`).
 - On the first request of each batch size, the b12x kernels JIT-compile through the CUTLASS DSL, so the first requests are slow.
-- Images are tagged by engine commit: `:latest` = `:v3-87b3a16b` (this snapshot); `:v3-56f5d8fe` is the previous one.
+- Images are tagged by engine commit: `:latest` = `:v3-80f39220` (this snapshot); `:v3-56f5d8fe` is the previous one.
 
 | Env (pass with `-e`) | Default | |
 |---|---|---|
@@ -85,7 +85,7 @@ FlashInfer's own `b12x` extra asks for torch >= 2.12. The kernels import and run
 - Docker with the NVIDIA container toolkit.
 
 ## Status (work in progress)
-Measured 2026-11-15 on 4x RTX PRO 6000 at the 300 W power cap, served through the Local Studio recipe below (image `v3-87b3a16b`). All decode numbers use speculative decoding with CUDA graphs; there is no plain-decode path.
+Measured 2026-11-15 on 4x RTX PRO 6000 at the 300 W power cap, served through the Local Studio recipe below (image `v3-80f39220`). All decode numbers use speculative decoding with CUDA graphs; there is no plain-decode path.
 
 **Prefill (LIL-bench `llm_decode_bench.py --prefill-only`, served, temp 0)**, against [Flare](https://github.com/NVIDIA/hyperflare-inference) (NVFP4 W4A4 experts, FP8 KV) on 4x RTX PRO 6000, as published by Local Inference Lab:
 
@@ -128,7 +128,7 @@ The server runs as one [Local Studio](https://github.com/sybil-solutions/local-s
 ```json
 {
   "id": "inkling-2-small", "name": "inkling-2-small", "served_model_name": "inkling-2-small",
-  "backend": "exllamav3", "runtime": {"kind": "docker", "ref": "ghcr.io/0xsero/inkling2-exl3:v3-87b3a16b"},
+  "backend": "exllamav3", "runtime": {"kind": "docker", "ref": "ghcr.io/0xsero/inkling2-exl3:v3-80f39220"},
   "env_vars": {"NGPU": "4", "I2_PC_SHARD": "1", "XDG_CACHE_HOME": "/cache", "TRITON_CACHE_DIR": "/cache/triton"},
   "max_model_len": 380000, "max_num_seqs": 16, "port": 8000,
   "extra_args": {
@@ -191,7 +191,7 @@ Expect these numbers to move.
 
 **Verification:**
 - **Docker GPU run, verified on image `v3-40fafdc7`** (`sha256:1a2b5d90…`, the previous snapshot): `/health` reported `kv_tokens` 6,358,400 with speculative decoding on; a chat request returned a correct answer; a 16-request burst completed with every request OK, at 435 tok/s end-to-end.
-- **Image `v3-87b3a16b` (`:latest`) is the code every number above ran on, inside Docker, through Local Studio.**
+- **Image `v3-80f39220` (`:latest`) is the code every number above ran on, inside Docker, through Local Studio.**
 - **Image `v3-bfa11bed` (previous snapshot): build and in-image import check only.** The check loads the exllamav3 extension and every overlay module (including the new skinny-GEMM and Markov-head modules), imports the b12x kernels from the pinned FlashInfer tree, and compiles the server and sweep. Its containerized GPU run is not verified yet: the GPUs were in use for engine work. The speed, KV and KLD numbers above come from the same code and the same pinned versions outside Docker.
 - Refresh the engine code with `scripts/update_snapshot.sh <fork checkout>`. It also syncs `server/i2_server.py`. The current snapshot's fork commit is in `overlay/FORK_COMMIT`. Run `scripts/audit.sh` before pushing.
 

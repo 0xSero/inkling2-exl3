@@ -765,6 +765,18 @@ async def health(): return {"status": "ok", "stats": STATS, "spec": SPEC, "kv_to
 @app.get("/v1/models")
 async def models(): return {"object": "list", "data": [{"id": args.served_name, "object": "model", "owned_by": "local"}]}
 
+@app.post("/tokenize")
+@app.post("/v1/tokenize")
+async def tokenize(request: Request):
+    """vLLM-style token count: {"prompt": text} or {"messages": [...]} (rendered with the chat template)"""
+    body = await request.json()
+    if body.get("messages"):
+        text = render_prompt(norm_messages(body["messages"]), body.get("tools"), body.get("reasoning_effort"))
+    else:
+        text = body.get("prompt") or body.get("content") or body.get("text") or ""
+    ids = encode(text)
+    return {"tokens": ids, "count": len(ids), "max_model_len": args.max_model_len}
+
 def norm_messages(msgs):
     out = []
     for m in msgs:

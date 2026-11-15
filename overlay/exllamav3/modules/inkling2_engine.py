@@ -115,6 +115,20 @@ class I2Engine:
         # rounded to bf16 by the consuming sconv anyway; fp16 halves the PCIe bytes vs fp32 with 3 more mantissa bits than bf16
         self.ar_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[__import__('os').environ.get('I2_AR_DTYPE', 'fp16')]
         self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= 64 projections
+        # FP8 weight-only attention projections (e4m3, per-output-row scale; I2_ATTN_FP8=1): halves the dense bytes every
+        # decode step reads and frees their memory for KV. Decode / verify (<= 128 rows) run the FP8 skinny GEMM; bigger
+        # calls dequantize per call (same rounded weights in both paths)
+        self.attn_fp8 = __import__('os').environ.get('I2_ATTN_FP8', '0') == '1'
+        if self.attn_fp8:
+            from .inkling2_gemm import quant_fp8_rows
+            for L in self.layers:
+                for k in ("wq_cat", "wk_cat", "wv_cat", "wqkv", "wo"):
+                    w = getattr(L, k, None)
+                    if w is None: continue
+                    q8, s8 = quant_fp8_rows(w)
+                    setattr(L, k + "_q8", q8); setattr(L, k + "_s8", s8); setattr(L, k, None)
+                    del w
+            torch.cuda.empty_cache()
         self.rel_fused = __import__('os').environ.get('I2_REL_FUSED', '1') == '1'   # relative bias inside the attention kernel
         # query-blocked global attention for multi-row eager batches (prefill / mixed steps) of at least this many rows
         self.attn_prefill_min = int(__import__('os').environ.get('I2_ATTN_PREFILL_MIN', 65))
@@ -195,6 +209,23 @@ class I2Engine:
             tot += sum(x.numel() * x.element_size() for x in t if x is not None)
         return tot
 
+    def mmw(self, x, L, k, out_dtype = torch.bfloat16):
+        """x @ (layer weight k)^T: bf16 weight, or its FP8 rows + scales (I2_ATTN_FP8)"""
+        w = getattr(L, k)
+        if w is not None:
+            if out_dtype == torch.bfloat16:
+                return self.mm(x, w)
+            if self.skinny and x.shape[0] <= 64:
+                return skinny_mm(x, w, out_dtype = out_dtype)
+            y = torch.mm(x, w.t(), out_dtype = torch.float32)
+            return y if out_dtype == torch.float32 else y.to(out_dtype)
+        q8, s8 = getattr(L, k + "_q8"), getattr(L, k + "_s8")
+        if x.shape[0] <= 128:
+            return skinny_mm(x, q8, s8, out_dtype = out_dtype)
+        wd = (q8.float() * s8[:, None]).to(torch.bfloat16)
+        y = torch.mm(x, wd.t(), out_dtype = torch.float32)
+        return y if out_dtype == torch.float32 else y.to(out_dtype)
+
     def mm(self, x, w):
         """x [T, K] @ w[N, K]^T in bf16 (skinny Triton GEMM for decode/verify-sized T)"""
         if self.skinny and x.shape[0] <= 64:
@@ -272,6 +303,8 @@ class I2Engine:
 
     def _oproj(self, L: Inkling2Layer, o):
         """attention output projection partial [T, D] in the all-reduce dtype"""
+        if L.wo is None:            # FP8 weights (I2_ATTN_FP8)
+            return self.mmw(o, L, "wo", out_dtype = self.ar_dtype)
         if self.skinny and o.shape[0] <= 64:
             return skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
         oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
@@ -293,9 +326,9 @@ class I2Engine:
 
         # projections
         if L.is_global:
-            qb = self.mm(xs[0], L.wq_cat)
-            kb = self.mm(xs[1], L.wk_cat)
-            vb = self.mm(xs[2], L.wv_cat)
+            qb = self.mmw(xs[0], L, "wq_cat")
+            kb = self.mmw(xs[1], L, "wk_cat")
+            vb = self.mmw(xs[2], L, "wv_cat")
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             ops.qkv_post(qb, kb, vb, L.kc_static, L.vc_static, L.q_scale, L.rel_scale, kring, vring, B.slot, B.pos, B.nprev,
                          q_out, rel_out, kq, vq, ks, vs, self.page_table, c, True, bits, rel_off, Hkl * 128, Hkl * 128,
@@ -303,7 +336,7 @@ class I2Engine:
             kraw, vraw = kb, vb
             Nq = qb
         else:
-            qb = self.mm(xs[0], L.wqkv)
+            qb = self.mmw(xs[0], L, "wqkv")
             rel_off, gate_off, sink_off = Hl * 128, Hl * 128 + Hl * 16, Hl * 128 + Hl * 16 + Hl * 128
             koff = sink_off + Hl
             kbv, vbv = qb[:, koff:], qb[:, koff + Hkl * 128:]
