@@ -38,6 +38,8 @@ ap.add_argument("--prefill-budget", type=int, default=512, help="prefill tokens 
 ap.add_argument("--state-slots", type=int, default=24, help="sequence state slots (rings + pages); beyond --slots they hold parked sessions for reuse")
 ap.add_argument("--reuse", type=int, default=0, help="session reuse: a new request extending a parked session's history takes its slot over and prefills only the rest (needs --mixed 1)")
 ap.add_argument("--reuse-min", type=int, default=1024, help="minimum reused prefix (tokens)")
+ap.add_argument("--split-chunk", type=int, default=2048, help="while requests decode, prefill pending prompts as separate token-sharded chunks of this many rows (one chunk, then one graph decode step per round) instead of mixed 512-row steps; 0 = mixed steps")
+ap.add_argument("--split-min", type=int, default=8192, help="split mode only for prompts with at least this many tokens left to prefill (short prompts stay in mixed steps)")
 ap.add_argument("--max-step-rows", type=int, default=512, help="rows per mixed (decode + prefill) forward: keeps the decoding users' step near a 512-row chunk")
 ap.add_argument("--served-name", default="inkling-2-small")
 ap.add_argument("--adaptive", type=int, default=1, help="adaptive verification: every round drafts the full 7-token block; inside the graph each request verifies the live width (rows incl. anchor) with the most expected tokens per ms (calibrated draft confidence x measured round cost, shared row budget); one graph per (bucket, physical width)")
@@ -270,7 +272,10 @@ def do_prefill(h, pay, fpay):
     b = Batch(torch.full((n,), slot, dtype=torch.int32, device=dev), pos, torch.arange(n, dtype=torch.int32, device=dev), True,
               nsplit_g=8, nsplit_l=4)
     taps = torch.empty((n, 8, 4608), dtype=torch.bfloat16, device=dev) if SPEC else None
-    z = eng.forward(ids, b, taps=taps)
+    if last:      # logits only for the sampled last row (a [n, V/4] fp32 head GEMM per chunk otherwise)
+        z = eng.forward(ids, b, taps=taps, logit_rows=torch.tensor([n - 1], dtype=torch.long, device=dev))
+    else:
+        z = None; eng.forward(ids, b, taps=taps, return_hidden=True)
     if SPEC:
         draft.store_context(taps, b.slot, b.pos)
     if last:
@@ -427,7 +432,7 @@ if rank != 0:
 # ====================================================================================================== rank 0 only
 from tokenizers import Tokenizer
 import jinja2
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
@@ -569,11 +574,15 @@ def scheduler():
                 do_pages(HDR.tolist(), PAY[:len(req.pages)], None)
                 if getattr(req, "restore", False):          # session reuse at the previous prompt end: conv rings back
                     bcast([OP_RESTORE, req.slot, 1, 0, 0, 0, 0, 0]); do_snap(HDR.tolist(), None, None)
-        if args.mixed and prefilling:
+        split = bool(args.split_chunk and active and prefilling and len(prefilling[0].ids) - prefilling[0].done_prompt >= args.split_min)
+        if split:
+            for req in [r for r in prefilling if getattr(r, "cancelled", False)]:     # client gone during its prefill
+                prefilling.remove(req); free_slots.append(req.slot); free_pages.extend(req.pages); STATS['aborted'] += 1
+        if args.mixed and prefilling and not split:
             mixed_round(); continue
         if prefilling:
             req = prefilling[0]
-            n = min(args.chunk, len(req.ids) - req.done_prompt)
+            n = min(args.split_chunk if split else args.chunk, len(req.ids) - req.done_prompt)
             first = req.done_prompt == 0
             last = req.done_prompt + n == len(req.ids)
             pay = req.ids[req.done_prompt:req.done_prompt + n] + (req.pages if first else [])
@@ -803,8 +812,12 @@ async def run_request(body, chat):
     if chat and body.get("raw_prompt"):      # extension: pre-rendered prompt in the model's chat format (eval harness)
         prompt = body["raw_prompt"]
     elif chat:
+        if not isinstance(body.get("messages"), list) or not body["messages"]:
+            raise HTTPException(400, "messages: a non-empty list is required")
         prompt = render_prompt(norm_messages(body["messages"]), body.get("tools"), body.get("reasoning_effort"))
     else:
+        if body.get("prompt") in (None, "", []):
+            raise HTTPException(400, "prompt is required")
         prompt = body["prompt"] if isinstance(body["prompt"], str) else body["prompt"][0]
     ids = encode(prompt)
     max_tokens = int(body.get("max_completion_tokens") or body.get("max_tokens") or 4096)

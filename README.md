@@ -28,7 +28,7 @@ The first run downloads the model (~313 GB, resumable) into `$HOME/models/Inklin
 - `sweep` prints a markdown table (median of 3 repeats) and writes JSON to `/models/results/`.
 - `serve` exposes `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/tokenize` and `/health`. `/health` also reports the KV token capacity (`kv_tokens`).
 - On the first request of each batch size, the b12x kernels JIT-compile through the CUTLASS DSL, so the first requests are slow.
-- Images are tagged by engine commit: `:latest` = `:v3-80f39220` (this snapshot); `:v3-56f5d8fe` is the previous one.
+- Images are tagged by engine commit: `:latest` = `:v3-744aa465` (this snapshot); `:v3-80f39220` is the previous one.
 
 | Env (pass with `-e`) | Default | |
 |---|---|---|
@@ -58,6 +58,7 @@ Server flags go after `serve`:
 | `--kv-gb` | auto | KV budget per GPU |
 | `--reserve-gb` | `2.75` | free memory kept for workspace when sizing the KV pool automatically |
 | `--chunk` | `4096` | prefill chunk rows |
+| `--split-chunk` / `--split-min` | `2048` / `8192` | prefill rows per chunk for long prompts while others decode / minimum tokens left for that mode |
 | `--served-name` | `inkling-2-small` | model id in `/v1/models` |
 | `--b12x` | `$I2_B12X` | |
 
@@ -107,6 +108,7 @@ Measured 2026-11-15 on 4x RTX PRO 6000 at the 300 W power cap, served through th
 - The strict limit is per operator max(bytes / 1634 GB/s, FLOPs / MMA rate reachable at 300 W), summed over a step, with communication overlapped (`serving/limits.py` in the fork). Prefill limits: 21,337 / 18,543 / 16,130 / 10,793 tok/s at 8K / 64K / 128K / 380K. Decode: 330 / 515 / 843 / 1,298 / 1,955 tok/s at c1-c16.
 - What doubled prefill: token-sharded layers with copy-engine collectives (the old path moved 9-38 MB all-reduces through NCCL at ~16 GB/s; the copy engines run 43-50 GB/s and overlap compute), the CUDA prefill attention (global layers 1.1-1.2x their FLOP floor from 8K context), 4096-row chunks with 48-row b12x route blocks.
 - Where prefill time goes now (one 4096-row chunk at 32K, slowest rank): experts ~250 ms, copy-engine traffic ~120 ms, attention ~50 ms, dense GEMMs ~50 ms. Next: overlap the traffic with a second micro-batch, balance the slower GPU pair, fp8 expert packets.
+- **Prefill while others decode:** a long prompt (>= 8,192 tokens left) that arrives while other sessions are decoding is read in token-sharded 2,048-row chunks between their decode steps (`--split-chunk 2048`). With 4 sessions decoding, a 64K prompt's time to first token drops from 18.4 s to 10.4 s, and the decoding sessions lose fewer tokens overall (shorter interruption). Short prompts keep the mixed decode+prefill steps.
 - **Adaptive verification** (`--adaptive 1`, default): every round drafts the full 7-token block, and inside the CUDA graph each request verifies the width (1-7 drafts) with the most expected tokens per ms, from calibrated draft confidence and a measured round-cost table. Rows a request doesn't verify skip their routed experts. On one server, same session: +4 / +7 / +6 / +7% at c2 / c4 / c8 / c16 against fixed draft lengths; acceptance length 2.50-2.72.
 
 **Quality gates (every promotion):**
@@ -128,7 +130,7 @@ The server runs as one [Local Studio](https://github.com/sybil-solutions/local-s
 ```json
 {
   "id": "inkling-2-small", "name": "inkling-2-small", "served_model_name": "inkling-2-small",
-  "backend": "exllamav3", "runtime": {"kind": "docker", "ref": "ghcr.io/0xsero/inkling2-exl3:v3-80f39220"},
+  "backend": "exllamav3", "runtime": {"kind": "docker", "ref": "ghcr.io/0xsero/inkling2-exl3:v3-744aa465"},
   "env_vars": {"NGPU": "4", "I2_PC_SHARD": "1", "XDG_CACHE_HOME": "/cache", "TRITON_CACHE_DIR": "/cache/triton"},
   "max_model_len": 380000, "max_num_seqs": 16, "port": 8000,
   "extra_args": {
@@ -191,7 +193,7 @@ Expect these numbers to move.
 
 **Verification:**
 - **Docker GPU run, verified on image `v3-40fafdc7`** (`sha256:1a2b5d90…`, the previous snapshot): `/health` reported `kv_tokens` 6,358,400 with speculative decoding on; a chat request returned a correct answer; a 16-request burst completed with every request OK, at 435 tok/s end-to-end.
-- **Image `v3-80f39220` (`:latest`) is the code every number above ran on, inside Docker, through Local Studio.**
+- **Image `v3-744aa465` (`:latest`) is the code every number above ran on, inside Docker, through Local Studio.**
 - **Image `v3-bfa11bed` (previous snapshot): build and in-image import check only.** The check loads the exllamav3 extension and every overlay module (including the new skinny-GEMM and Markov-head modules), imports the b12x kernels from the pinned FlashInfer tree, and compiles the server and sweep. Its containerized GPU run is not verified yet: the GPUs were in use for engine work. The speed, KV and KLD numbers above come from the same code and the same pinned versions outside Docker.
 - Refresh the engine code with `scripts/update_snapshot.sh <fork checkout>`. It also syncs `server/i2_server.py`. The current snapshot's fork commit is in `overlay/FORK_COMMIT`. Run `scripts/audit.sh` before pushing.
 

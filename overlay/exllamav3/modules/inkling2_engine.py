@@ -114,7 +114,8 @@ class I2Engine:
         # dtype of the two per-layer all-reduces (attention o_proj partials, routed-expert partials): the sums are
         # rounded to bf16 by the consuming sconv anyway; fp16 halves the PCIe bytes vs fp32 with 3 more mantissa bits than bf16
         self.ar_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[__import__('os').environ.get('I2_AR_DTYPE', 'fp16')]
-        self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= 64 projections
+        self.skinny = __import__('os').environ.get('I2_SKINNY', '1') == '1'      # Triton skinny GEMM for T <= skinny_max projections
+        self.skinny_max = int(__import__('os').environ.get('I2_SKINNY_MAX', 64))
         # FP8 weight-only attention projections (e4m3, per-output-row scale; I2_ATTN_FP8=1): halves the dense bytes every
         # decode step reads and frees their memory for KV. Decode / verify (<= 128 rows) run the FP8 skinny GEMM; bigger
         # calls dequantize per call (same rounded weights in both paths)
@@ -215,7 +216,7 @@ class I2Engine:
         if w is not None:
             if out_dtype == torch.bfloat16:
                 return self.mm(x, w)
-            if self.skinny and x.shape[0] <= 64:
+            if self.skinny and x.shape[0] <= self.skinny_max:
                 return skinny_mm(x, w, out_dtype = out_dtype)
             y = torch.mm(x, w.t(), out_dtype = torch.float32)
             return y if out_dtype == torch.float32 else y.to(out_dtype)
@@ -228,7 +229,7 @@ class I2Engine:
 
     def mm(self, x, w):
         """x [T, K] @ w[N, K]^T in bf16 (skinny Triton GEMM for decode/verify-sized T)"""
-        if self.skinny and x.shape[0] <= 64:
+        if self.skinny and x.shape[0] <= self.skinny_max:
             return skinny_mm(x, w, out_dtype = torch.bfloat16)
         return torch.mm(x, w.t())
 
@@ -305,7 +306,7 @@ class I2Engine:
         """attention output projection partial [T, D] in the all-reduce dtype"""
         if L.wo is None:            # FP8 weights (I2_ATTN_FP8)
             return self.mmw(o, L, "wo", out_dtype = self.ar_dtype)
-        if self.skinny and o.shape[0] <= 64:
+        if self.skinny and o.shape[0] <= self.skinny_max:
             return skinny_mm(o, L.wo, out_dtype = self.ar_dtype)          # fp32 accumulation, one rounding to the AR dtype
         oa = torch.mm(o, L.wo.t(), out_dtype = torch.float32)
         return oa.to(self.ar_dtype) if self.ar_dtype != torch.float32 else oa
